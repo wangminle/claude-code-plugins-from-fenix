@@ -1,19 +1,80 @@
 #!/usr/bin/env python3
-"""Claude Code status line: 显示会话平均与当前轮次的 token 生成速度。
+"""Claude Code 状态栏：实时解码速度 + 累积用量。
 
-Claude Code 会通过 stdin 传入一份 JSON，包含 transcript_path、
-cost.total_api_duration_ms、context_window 等字段。本脚本增量解析
-transcript（JSONL，只读新增部分，结果按文件大小缓存）：
+═══════════════════════════════════════════════════════════════════
+一、长什么样
+═══════════════════════════════════════════════════════════════════
 
-* 平均速度 = 会话累计 output tokens / 会话累计 API 等待时长；
-* 本轮速度 = 本轮开始（最近一条用户 prompt 落盘）后新增的 output
-  tokens / 本轮累计 API 等待时长（用两次状态栏刷新的 api 时长差估算）；
-* 今日 = 本地 0 点至今，所有会话的 input + output + cache token 总量；
-* 自重置 = 从上次 `--reset` 起，上述口径的 token 总量。
+  ⏱ 本轮 42.7 tok/s · 平均 38.1 tok/s · 1.2M out · 今日 117.4M tok
+    · 自重置 6.4M tok · ctx 23% · Opus 5
 
-同一条 assistant 消息在流式过程中会被写入多条 usage 快照，必须按
-message.id 去重取最大值，否则会重复计数。跨会话统计使用
-usage-index.json 增量索引，并保留每条消息的时间戳以支持按日/按重置点汇总。
+  ⏱ 本轮  本次提问后新增的 output tokens ÷ 本轮 API 耗时。不足 0.8 秒
+          不显示（样本太短、抖动大）。只认你真正发起的提问
+          （promptSource 为 typed/sdk/queued），系统通知、工具结果不计入。
+  平均     本会话累计 output tokens ÷ 本会话累计 API 耗时；含工具往返
+          等空转，通常低于瞬时速度，当下界看即可。
+  N out    本会话 transcript 里累计的 output tokens。
+  今日     本地 0 点至今、所有会话的 input + output + 缓存读写总量。
+  自重置   同上口径，起点是最近一次 --reset（没重置过则以首次运行时刻为起点）。
+  ctx      context 已用百分比，由 Claude Code 直接传入。
+  末尾     当前模型显示名。
+
+═══════════════════════════════════════════════════════════════════
+二、怎么装上
+═══════════════════════════════════════════════════════════════════
+
+在 ~/.claude/settings.json 里加（路径换成本脚本的实际位置）：
+
+  "statusLine": {
+    "type": "command",
+    "command": "python3 '/绝对/路径/statusline-tokens.py'"
+  }
+
+  * 只对终端里的 claude CLI 生效；Claude Desktop 的界面不读这个配置。
+  * 路径含空格或中文时一定要用单引号包住，JSON 里不用转义。
+  * 想让它每秒重算（默认只在事件发生时刷新）再加 "refreshInterval": 1，
+    代价是每秒多起一个 python 进程。
+  * 改完开新会话才生效。
+
+═══════════════════════════════════════════════════════════════════
+三、命令行
+═══════════════════════════════════════════════════════════════════
+
+  python3 statusline-tokens.py --reset   # 把“自重置”起点设为现在
+  python3 statusline-tokens.py --help    # 帮助
+  python3 statusline-tokens.py           # 正常模式：从 stdin 读 Claude Code 的 JSON
+
+  手动试跑（不看 Claude Code 脸色）：
+
+  echo '{"transcript_path":"~/.claude/projects/x/y.jsonl","cost":{"total_api_duration_ms":5000}}' \\
+    | python3 statusline-tokens.py
+
+═══════════════════════════════════════════════════════════════════
+四、数据文件（都在家目录，脚本不写当前目录）
+═══════════════════════════════════════════════════════════════════
+
+  ~/.cache/claude-statusline/usage-index.json   跨会话增量索引（今日/自重置口径）
+  ~/.cache/claude-statusline/<hash>.json        单会话缓存（按 transcript 路径哈希）
+  ~/.cache/claude-statusline/usage-index.lock   索引写锁
+  ~/.claude/statusline-usage-reset.json         最近一次 --reset 的时间戳
+
+索引只保留「今日」和「自重置」两个窗口仍然需要的记录，更早的每次写回时
+自动裁掉，所以不会随历史无限增长。删掉 ~/.cache/claude-statusline 不丢数据，
+只是下次要全量重扫 ~/.claude/projects（几百 MB 时首次数秒）。
+
+═══════════════════════════════════════════════════════════════════
+五、实现要点
+═══════════════════════════════════════════════════════════════════
+
+* Claude Code 通过 stdin 传入一份 JSON（transcript_path、
+  cost.total_api_duration_ms、context_window、model 等）。
+* transcript 是 JSONL，按字节 offset 增量读取，只解析新增部分；
+  末尾写了一半的行留到下次再说。
+* 同一条 assistant 消息在流式过程中会被写入多条 usage 快照，必须按
+  message.id 去重取最大值，否则会重复计数。
+* 「本轮」基线取自最早检测到新 prompt 的那次刷新：记下那一刻的 api
+  时长与输出总量，之后用差值算速度。
+* 统计失败一律吞掉：状态栏宁可少一行，也不能因为算不出数字整行空掉。
 """
 
 import datetime
@@ -35,6 +96,12 @@ RESET_FILE = os.path.expanduser("~/.claude/statusline-usage-reset.json")
 TRANSCRIPT_ROOT = os.path.expanduser("~/.claude/projects")
 
 TURN_MIN_MS = 800  # 本轮做过短时速度抖动大，先不显示
+
+# 哪些 promptSource 才算「用户开了一轮」。注意系统注入的消息（后台任务完成
+# 通知、跨会话消息、各种提醒）带的是 "system"，它们既不是 isMeta 也不是工具
+# 结果；若按旧逻辑当成新提问，本轮速度的基线会在回复中途被重置，显示值突然
+# 变成 -- 或一个明显偏小的数。
+REAL_PROMPT_SOURCES = ("typed", "sdk", "queued")
 
 
 def load_cache(path):
@@ -77,9 +144,12 @@ def scan_new(path, offset, msgs):
             continue
         typ = obj.get("type")
         if typ == "user":
-            # 工具结果条目也带 promptId，必须排除；真实用户提示带
-            # promptSource（如 typed），本地命令输出/工具结果没有。
-            if obj.get("isMeta") or not obj.get("promptSource"):
+            # 白名单而非「有 promptSource 就算」：工具结果条目不只有 promptId，
+            # 系统注入的通知还带 promptSource="system"（本地 transcript 里
+            # 有数百条），把它们算成新提问会让本轮速度的基线中途归零。
+            if obj.get("promptSource") not in REAL_PROMPT_SOURCES:
+                continue
+            if obj.get("isMeta"):
                 continue
             content = (obj.get("message") or {}).get("content")
             if isinstance(content, list) and any(
@@ -244,6 +314,58 @@ def scan_usage_file(path, entry):
     return new_offset, msgs, changed
 
 
+def totals_from_index(index, today_start, reset_ts):
+    """把索引里的消息记录按时间窗口汇总成 (今日, 自重置)。"""
+    today = 0
+    since_reset = 0
+    for entry in index["files"].values():
+        for rec in (entry.get("msgs") or {}).values():
+            if not isinstance(rec, list) or len(rec) < 2:
+                continue
+            ts, total = rec[0], rec[1]
+            if not isinstance(ts, (int, float)) or not isinstance(total, int):
+                continue
+            if ts >= today_start:
+                today += total
+            if ts >= reset_ts:
+                since_reset += total
+    return today, since_reset
+
+
+def prune_index(index, cutoff):
+    """丢掉早于 cutoff 的记录，返回丢掉的条数。
+
+    早于 today_start 与 reset_ts 中较早者的消息，再也进不了任何一个统计
+    窗口，留着纯属占地方——而这份索引每次有变化都要整体重写一遍。实测本机
+    两万多条记录里有 97% 属于这一类，不裁的话文件只会随使用历史一直变大。
+    顺带清掉指向已删除 transcript 的空条目。
+    """
+    dropped = 0
+    for path in list(index["files"]):
+        entry = index["files"][path]
+        msgs = entry.get("msgs")
+        if not isinstance(msgs, dict):
+            msgs = {}
+        stale = [
+            mid
+            for mid, rec in msgs.items()
+            if not (
+                isinstance(rec, list)
+                and len(rec) >= 2
+                and isinstance(rec[0], (int, float))
+                and rec[0] >= cutoff
+            )
+        ]
+        for mid in stale:
+            del msgs[mid]
+        dropped += len(stale)
+        entry["msgs"] = msgs
+        if not msgs and not os.path.exists(path):
+            del index["files"][path]
+            dropped += 1
+    return dropped
+
+
 def usage_totals():
     """返回 (今日总 token, 自上次重置以来总 token)。
 
@@ -267,7 +389,12 @@ def usage_totals():
     lock_file = None
     try:
         lock_file = open(USAGE_LOCK, "w")
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            # 拿不到锁就退回读盘上的旧索引：状态栏晚一拍更新可以接受，
+            # 卡在别人后面等（甚至等一个卡死的进程）不行。
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return totals_from_index(load_usage_index(), today_start, reset_ts)
 
         index = load_usage_index()
         dirty = False
@@ -288,23 +415,13 @@ def usage_totals():
                 entry["offset"] = new_offset
                 entry["msgs"] = msgs
                 dirty = True
+
+        if prune_index(index, min(today_start, reset_ts)):
+            dirty = True
         if dirty:
             save_usage_index(index)
 
-        today = 0
-        since_reset = 0
-        for entry in index["files"].values():
-            for rec in (entry.get("msgs") or {}).values():
-                if not isinstance(rec, list) or len(rec) < 2:
-                    continue
-                ts, total = rec[0], rec[1]
-                if not isinstance(ts, (int, float)) or not isinstance(total, int):
-                    continue
-                if ts >= today_start:
-                    today += total
-                if ts >= reset_ts:
-                    since_reset += total
-        return today, since_reset
+        return totals_from_index(index, today_start, reset_ts)
     finally:
         if lock_file is not None:
             try:
@@ -397,8 +514,8 @@ def main():
 
     if turn_speed is not None:
         parts.append(f"⏱ 本轮 {turn_speed:.1f} tok/s")
-    elif turn_ms is not None:
-        parts.append("⏱ 本轮 --")
+    # 本轮刚起步（不足 TURN_MIN_MS）或还没产出时整段不显示：
+    # 每轮开头先闪一个 "--" 纯属噪声。
 
     if api_ms > 0 and total_out:
         parts.append(f"平均 {total_out / (api_ms / 1000):.1f} tok/s")

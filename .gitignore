@@ -1,0 +1,55 @@
+# ── macOS 垃圾 ───────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+Icon?
+*.swp
+*~
+
+# ── Python 缓存与字节码 ──────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ── 虚拟环境 ────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── 测试 / 类型检查 / 格式化缓存 ────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# ── Jupyter ─────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── 本工具的运行产物（正常落在 ~/.cache 与 ~/.claude，这里兜底）──
+usage-index.json
+usage-index.lock
+statusline-usage-reset.json
+*.log
+
+# ── 本机任务台账（个人进度记录，不随仓库发布）────────────────
+task-list.md
+task-list.md.lock
+task-list-archive-*.md
+
+# ── Claude Code 本机私有配置（整体不随仓库发布）──────────────
+# 含 settings.json、hooks/ 与个人覆盖文件。注意：这样 clone 下来的人
+# 拿不到 Stop hook，需要自己装；CLAUDE.md 的规则仍会生效。
+.claude/
