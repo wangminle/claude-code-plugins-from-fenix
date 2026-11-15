@@ -34,6 +34,9 @@
   * 路径含空格或中文时一定要用单引号包住，JSON 里不用转义。
   * 想让它每秒重算（默认只在事件发生时刷新）再加 "refreshInterval": 1，
     代价是每秒多起一个 python 进程。
+  * 只用标准库。文件锁依赖 Unix 的 fcntl，Windows 上自动退化为不加锁：
+    单机单会话没有区别，多会话并发时最多重复解析同一段 transcript
+    （按 message.id 去重，不会重复计数）。
   * 改完开新会话才生效。
 
 ═══════════════════════════════════════════════════════════════════
@@ -59,8 +62,9 @@
   ~/.claude/statusline-usage-reset.json         最近一次 --reset 的时间戳
 
 索引只保留「今日」和「自重置」两个窗口仍然需要的记录，更早的每次写回时
-自动裁掉，所以不会随历史无限增长。删掉 ~/.cache/claude-statusline 不丢数据，
-只是下次要全量重扫 ~/.claude/projects（几百 MB 时首次数秒）。
+自动裁掉，所以不会随历史无限增长。单会话缓存 30 天没更新会自动清理（每天
+最多扫一次，只清早就不再使用的会话）。删掉 ~/.cache/claude-statusline 不丢
+数据，只是下次要全量重扫 ~/.claude/projects（几百 MB 时首次数秒）。
 
 ═══════════════════════════════════════════════════════════════════
 五、实现要点
@@ -78,13 +82,17 @@
 """
 
 import datetime
-import fcntl
 import glob
 import hashlib
 import json
 import os
 import sys
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows 没有 flock：退化为不加锁，统计照常可用
+    fcntl = None
 
 CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
@@ -102,6 +110,12 @@ TURN_MIN_MS = 800  # 本轮做过短时速度抖动大，先不显示
 # 结果；若按旧逻辑当成新提问，本轮速度的基线会在回复中途被重置，显示值突然
 # 变成 -- 或一个明显偏小的数。
 REAL_PROMPT_SOURCES = ("typed", "sdk", "queued")
+
+# 单会话缓存（<16 位 hash>.json）保留天数：超过这么久没更新就清掉，免得
+# 一个会话留一个文件无限堆积。与 Claude Code 默认的 transcript 保留期
+# （cleanupPeriodDays=30）对齐；活跃会话每次渲染都会刷新 mtime，删不到。
+SESSION_CACHE_TTL_DAYS = 30
+SESSION_CACHE_SWEEP_MARK = os.path.join(CACHE_DIR, "last-sweep")
 
 
 def load_cache(path):
@@ -366,6 +380,50 @@ def prune_index(index, cutoff):
     return dropped
 
 
+def prune_session_caches(now_ts=None, max_age_days=SESSION_CACHE_TTL_DAYS):
+    """删掉长期未更新的单会话缓存，返回删除个数。
+
+    每个会话都会在 CACHE_DIR 下留一个 <16 位 hash>.json，只增不减。这里按
+    mtime 清掉早就不用的；正在用的会话每次渲染都会重写缓存、mtime 跟着刷新，
+    所以扫不到它。用文件名长度区分，不会误删 usage-index.json。
+    """
+    now = time.time() if now_ts is None else now_ts
+    cutoff = now - max_age_days * 86400
+    try:
+        names = os.listdir(CACHE_DIR)
+    except OSError:
+        return 0
+    removed = 0
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        if ext != ".json" or len(stem) != 16:
+            continue
+        path = os.path.join(CACHE_DIR, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def sweep_session_caches_once_a_day():
+    """每天最多清一次，省得每次渲染都列一遍目录。"""
+    now = time.time()
+    try:
+        if now - os.path.getmtime(SESSION_CACHE_SWEEP_MARK) < 86400:
+            return
+    except OSError:
+        pass
+    prune_session_caches(now)
+    try:
+        with open(SESSION_CACHE_SWEEP_MARK, "w") as f:
+            f.write(str(int(now)))
+    except OSError:
+        pass
+
+
 def usage_totals():
     """返回 (今日总 token, 自上次重置以来总 token)。
 
@@ -389,12 +447,13 @@ def usage_totals():
     lock_file = None
     try:
         lock_file = open(USAGE_LOCK, "w")
-        try:
-            # 拿不到锁就退回读盘上的旧索引：状态栏晚一拍更新可以接受，
-            # 卡在别人后面等（甚至等一个卡死的进程）不行。
-            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return totals_from_index(load_usage_index(), today_start, reset_ts)
+        if fcntl is not None:
+            try:
+                # 拿不到锁就退回读盘上的旧索引：状态栏晚一拍更新可以接受，
+                # 卡在别人后面等（甚至等一个卡死的进程）不行。
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return totals_from_index(load_usage_index(), today_start, reset_ts)
 
         index = load_usage_index()
         dirty = False
@@ -418,6 +477,7 @@ def usage_totals():
 
         if prune_index(index, min(today_start, reset_ts)):
             dirty = True
+        sweep_session_caches_once_a_day()
         if dirty:
             save_usage_index(index)
 
@@ -425,7 +485,8 @@ def usage_totals():
     finally:
         if lock_file is not None:
             try:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
             finally:
                 lock_file.close()
 
