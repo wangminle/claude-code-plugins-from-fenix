@@ -76,8 +76,16 @@
   末尾写了一半的行留到下次再说。
 * 同一条 assistant 消息在流式过程中会被写入多条 usage 快照，必须按
   message.id 去重取最大值，否则会重复计数。
-* 「本轮」基线取自最早检测到新 prompt 的那次刷新：记下那一刻的 api
-  时长与输出总量，之后用差值算速度。
+* 「本轮」基线取自最早检测到新 prompt 的那次刷新：api 时长取当时的值，
+  输出总量取「该 prompt 在 transcript 里出现时」的累计值，同一块里它
+  之后的 assistant 输出属于本轮，不会被吞进基线。
+* cost.total_api_duration_ms 是每个 Claude Code 进程各自累计的。检测到它
+  回退（--resume 或重启）就把本轮基线与「平均」口径都改到本进程，避免用
+  历史全量 output 除以新进程的极小耗时。
+* 所有缓存与索引都原子写（每次写独立临时文件再 os.replace），读写一律
+  显式 UTF-8，stdin/stdout 也强制 UTF-8（Windows 默认 gbk/cp1252 不会崩）。
+* 外部 JSON（stdin、缓存、索引、transcript 行）一律按「形状不对就丢弃」
+  处理，bool 不算数字。
 * 统计失败一律吞掉：状态栏宁可少一行，也不能因为算不出数字整行空掉。
 """
 
@@ -85,8 +93,10 @@ import datetime
 import glob
 import hashlib
 import json
+import math
 import os
 import sys
+import tempfile
 import time
 
 try:
@@ -118,27 +128,116 @@ SESSION_CACHE_TTL_DAYS = 30
 SESSION_CACHE_SWEEP_MARK = os.path.join(CACHE_DIR, "last-sweep")
 
 
-def load_cache(path):
+def _is_int(value):
+    """真正的整数：bool 是 int 的子类，必须排除（True 不是 1 个 token）。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_num(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _atomic_write_json(path, obj, **dump_kwargs):
+    """原子写 JSON：每次写独立的临时文件再 os.replace。
+
+    固定的 <path>.tmp 在多进程并发时会被互相截断、互相 replace 走；
+    用 mkstemp 的唯一文件名，最坏情况只是后写者覆盖先写者。
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory
+    )
     try:
-        with open(path) as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, **dump_kwargs)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _force_utf8_stdio():
+    """Windows 中文版默认 gbk/cp1252：不重配的话输出 ⏱ 会 UnicodeEncodeError。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+def _read_stdin_json():
+    try:
+        raw = getattr(sys.stdin, "buffer", None)
+        if raw is not None:
+            text = raw.read().decode("utf-8", errors="replace")
+        else:
+            text = sys.stdin.read()
+        return json.loads(text)
+    except (ValueError, OSError):
+        return None
+
+
+def load_cache(path):
+    """读单会话缓存；任何形状不对的字段都丢弃，绝不抛异常。"""
+    blank = {"offset": 0, "msgs": {}}
+    try:
+        with open(path, encoding="utf-8") as f:
             d = json.load(f)
-        if isinstance(d.get("offset"), int) and isinstance(d.get("msgs"), dict):
-            return d
     except (OSError, ValueError):
-        pass
-    return {"offset": 0, "msgs": {}}
+        return blank
+    if not isinstance(d, dict):
+        return blank
+    offset = d.get("offset")
+    msgs = d.get("msgs")
+    if not _is_int(offset) or offset < 0 or not isinstance(msgs, dict):
+        return blank
+    state = {
+        "offset": offset,
+        "msgs": {
+            k: v
+            for k, v in msgs.items()
+            if isinstance(k, str) and _is_int(v) and v >= 0
+        },
+    }
+    if isinstance(d.get("prompt"), str):
+        state["prompt"] = d["prompt"]
+    if (
+        _is_num(d.get("base_api_ms"))
+        and d["base_api_ms"] >= 0
+        and _is_int(d.get("base_out"))
+        and d["base_out"] >= 0
+    ):
+        state["base_api_ms"] = d["base_api_ms"]
+        state["base_out"] = d["base_out"]
+    if _is_num(d.get("last_api_ms")) and d["last_api_ms"] >= 0:
+        state["last_api_ms"] = d["last_api_ms"]
+    if _is_int(d.get("avg_base_out")) and d["avg_base_out"] >= 0:
+        state["avg_base_out"] = d["avg_base_out"]
+    return state
 
 
 def save_cache(path, state):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f, separators=(",", ":"))
-    os.replace(tmp, path)
+    _atomic_write_json(path, state, separators=(",", ":"))
 
 
 def scan_new(path, offset, msgs):
-    """从 offset 起读取完整行，返回 (新 offset, 本块中最后一条用户 prompt 的 id)。
+    """从 offset 起读取完整行。
+
+    返回 (新 offset, 本块中最后一条用户 prompt 的 id, 该 prompt 出现时 msgs
+    的 output 累计值)。第三项是「本轮」基线：同一块里 prompt 之后才出现的
+    assistant 输出属于本轮，不能被算进基线。
 
     用户 prompt 用 promptId 识别（本地命令输出、工具结果都没有该字段）。
     """
@@ -146,15 +245,19 @@ def scan_new(path, offset, msgs):
         f.seek(offset)
         buf = f.read()
     if not buf:
-        return offset, None
+        return offset, None, None
     last_nl = buf.rfind(b"\n")
     if last_nl < 0:
-        return offset, None  # 最后一行还没写完，下次再解析
+        return offset, None, None  # 最后一行还没写完，下次再解析
     last_prompt = None
+    base_at_prompt = None
+    running = sum(msgs.values())
     for line in buf[: last_nl + 1].splitlines():
         try:
             obj = json.loads(line)
         except ValueError:
+            continue
+        if not isinstance(obj, dict):
             continue
         typ = obj.get("type")
         if typ == "user":
@@ -165,30 +268,33 @@ def scan_new(path, offset, msgs):
                 continue
             if obj.get("isMeta"):
                 continue
-            content = (obj.get("message") or {}).get("content")
+            content = _dict(obj.get("message")).get("content")
             if isinstance(content, list) and any(
                 isinstance(b, dict) and b.get("type") == "tool_result"
                 for b in content
             ):
                 continue
             pid = obj.get("promptId")
-            if pid:
+            if pid and isinstance(pid, str):
                 last_prompt = pid
+                base_at_prompt = running
             continue
         if typ != "assistant" or b'"output_tokens"' not in line:
             continue
-        msg = obj.get("message") or {}
-        n = (msg.get("usage") or {}).get("output_tokens")
+        msg = _dict(obj.get("message"))
+        n = _dict(msg.get("usage")).get("output_tokens")
         mid = msg.get("id")
-        if not isinstance(n, int) or n <= 0 or not mid:
+        if not _is_int(n) or n <= 0 or not isinstance(mid, str) or not mid:
             continue
-        if n > msgs.get(mid, 0):
+        old = msgs.get(mid, 0)
+        if n > old:
             msgs[mid] = n
-    return offset + last_nl + 1, last_prompt
+            running += n - old
+    return offset + last_nl + 1, last_prompt, base_at_prompt
 
 
 def _int(value):
-    return value if isinstance(value, int) else 0
+    return value if _is_int(value) else 0
 
 
 def parse_ts(value):
@@ -198,16 +304,16 @@ def parse_ts(value):
         return datetime.datetime.fromisoformat(
             value.replace("Z", "+00:00")
         ).timestamp()
-    except ValueError:
+    except (ValueError, OSError, OverflowError):
         return None
 
 
 def read_reset_ts():
     try:
-        with open(RESET_FILE) as f:
+        with open(RESET_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        ts = data.get("reset_ts")
-        if isinstance(ts, (int, float)) and ts > 0:
+        ts = _dict(data).get("reset_ts")
+        if _is_num(ts) and ts > 0:
             return float(ts)
     except (OSError, ValueError, TypeError):
         pass
@@ -215,27 +321,26 @@ def read_reset_ts():
 
 
 def write_reset_ts(ts):
-    os.makedirs(os.path.dirname(RESET_FILE), exist_ok=True)
-    tmp = RESET_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(
-            {
-                "reset_ts": ts,
-                "reset_at": datetime.datetime.fromtimestamp(ts)
-                .astimezone()
-                .isoformat(),
-            },
-            f,
-            ensure_ascii=False,
-        )
-    os.replace(tmp, RESET_FILE)
+    _atomic_write_json(
+        RESET_FILE,
+        {
+            "reset_ts": ts,
+            "reset_at": datetime.datetime.fromtimestamp(ts)
+            .astimezone()
+            .isoformat(),
+        },
+    )
 
 
 def load_usage_index():
     try:
-        with open(USAGE_INDEX) as f:
+        with open(USAGE_INDEX, encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("v") == 1 and isinstance(data.get("files"), dict):
+        if (
+            isinstance(data, dict)
+            and data.get("v") == 1
+            and isinstance(data.get("files"), dict)
+        ):
             return data
     except (OSError, ValueError):
         pass
@@ -243,11 +348,9 @@ def load_usage_index():
 
 
 def save_usage_index(index):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    tmp = USAGE_INDEX + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(index, f, separators=(",", ":"), ensure_ascii=False)
-    os.replace(tmp, USAGE_INDEX)
+    # 默认 ensure_ascii：路径里的非 ASCII 字符（甚至无法解码的字节）写成
+    # \uXXXX，与系统默认编码无关。
+    _atomic_write_json(USAGE_INDEX, index, separators=(",", ":"))
 
 
 def scan_usage_file(path, entry):
@@ -256,8 +359,9 @@ def scan_usage_file(path, entry):
     消息表按 message.id 去重，保存 [时间戳, 总 token]。同一消息的流式
     快照只保留最大值，避免重复计数。
     """
+    entry = _dict(entry)
     offset = entry.get("offset", 0)
-    if not isinstance(offset, int) or offset < 0:
+    if not _is_int(offset) or offset < 0:
         offset = 0
     msgs = entry.get("msgs")
     if not isinstance(msgs, dict):
@@ -291,13 +395,13 @@ def scan_usage_file(path, entry):
             obj = json.loads(line)
         except ValueError:
             continue
-        if obj.get("type") != "assistant":
+        if not isinstance(obj, dict) or obj.get("type") != "assistant":
             continue
-        msg = obj.get("message") or {}
-        usage = msg.get("usage") or {}
+        msg = _dict(obj.get("message"))
+        usage = _dict(msg.get("usage"))
         mid = msg.get("id")
         out = usage.get("output_tokens")
-        if not isinstance(out, int) or out < 0 or not isinstance(mid, str) or not mid:
+        if not _is_int(out) or out < 0 or not isinstance(mid, str) or not mid:
             continue
         ts = parse_ts(obj.get("timestamp"))
         if ts is None:
@@ -315,7 +419,7 @@ def scan_usage_file(path, entry):
             old[1]
             if isinstance(old, list)
             and len(old) >= 2
-            and isinstance(old[1], int)
+            and _is_int(old[1])
             else 0
         )
         if total > old_total:
@@ -333,11 +437,14 @@ def totals_from_index(index, today_start, reset_ts):
     today = 0
     since_reset = 0
     for entry in index["files"].values():
-        for rec in (entry.get("msgs") or {}).values():
+        msgs = _dict(entry).get("msgs")
+        if not isinstance(msgs, dict):
+            continue
+        for rec in msgs.values():
             if not isinstance(rec, list) or len(rec) < 2:
                 continue
             ts, total = rec[0], rec[1]
-            if not isinstance(ts, (int, float)) or not isinstance(total, int):
+            if not _is_num(ts) or not _is_int(total):
                 continue
             if ts >= today_start:
                 today += total
@@ -357,6 +464,10 @@ def prune_index(index, cutoff):
     dropped = 0
     for path in list(index["files"]):
         entry = index["files"][path]
+        if not isinstance(entry, dict):
+            del index["files"][path]
+            dropped += 1
+            continue
         msgs = entry.get("msgs")
         if not isinstance(msgs, dict):
             msgs = {}
@@ -366,7 +477,7 @@ def prune_index(index, cutoff):
             if not (
                 isinstance(rec, list)
                 and len(rec) >= 2
-                and isinstance(rec[0], (int, float))
+                and _is_num(rec[0])
                 and rec[0] >= cutoff
             )
         ]
@@ -396,11 +507,13 @@ def prune_session_caches(now_ts=None, max_age_days=SESSION_CACHE_TTL_DAYS):
     removed = 0
     for name in names:
         stem, ext = os.path.splitext(name)
-        if ext != ".json" or len(stem) != 16:
+        # 崩溃/被杀时遗留的原子写临时文件（mkstemp 生成的 *.tmp）
+        is_tmp = ext == ".tmp"
+        if not is_tmp and (ext != ".json" or len(stem) != 16):
             continue
         path = os.path.join(CACHE_DIR, name)
         try:
-            if os.path.getmtime(path) < cutoff:
+            if os.path.getmtime(path) < (now - 86400 if is_tmp else cutoff):
                 os.remove(path)
                 removed += 1
         except OSError:
@@ -418,7 +531,7 @@ def sweep_session_caches_once_a_day():
         pass
     prune_session_caches(now)
     try:
-        with open(SESSION_CACHE_SWEEP_MARK, "w") as f:
+        with open(SESSION_CACHE_SWEEP_MARK, "w", encoding="utf-8") as f:
             f.write(str(int(now)))
     except OSError:
         pass
@@ -446,8 +559,8 @@ def usage_totals():
     os.makedirs(CACHE_DIR, exist_ok=True)
     lock_file = None
     try:
-        lock_file = open(USAGE_LOCK, "w")
         if fcntl is not None:
+            lock_file = open(USAGE_LOCK, "w", encoding="utf-8")
             try:
                 # 拿不到锁就退回读盘上的旧索引：状态栏晚一拍更新可以接受，
                 # 卡在别人后面等（甚至等一个卡死的进程）不行。
@@ -459,14 +572,16 @@ def usage_totals():
         dirty = False
         pattern = os.path.join(TRANSCRIPT_ROOT, "**", "*.jsonl")
         for path in glob.glob(pattern, recursive=True):
-            entry = index["files"].get(path)
-            if not isinstance(entry, dict):
-                entry = {"offset": 0, "msgs": {}}
-                index["files"][path] = entry
+            # 先确认文件还在再建条目：glob 与 getsize 之间文件被删时，
+            # 不能留下空条目并白白触发一次整体重写。
             try:
                 size = os.path.getsize(path)
             except OSError:
                 continue
+            entry = index["files"].get(path)
+            if not isinstance(entry, dict):
+                entry = {"offset": 0, "msgs": {}}
+                index["files"][path] = entry
             if size == entry.get("offset"):
                 continue
             new_offset, msgs, changed = scan_usage_file(path, entry)
@@ -479,7 +594,10 @@ def usage_totals():
             dirty = True
         sweep_session_caches_once_a_day()
         if dirty:
-            save_usage_index(index)
+            try:
+                save_usage_index(index)
+            except OSError:
+                pass
 
         return totals_from_index(index, today_start, reset_ts)
     finally:
@@ -501,65 +619,161 @@ def reset_usage():
 
 
 def fmt_tokens(n):
-    if n >= 1_000_000_000:
+    # 阈值取「四舍五入后不会进位成 1000」的点：999_999 应显示 1.0M 而非 1000.0k
+    if n >= 999_950_000:
         return f"{n / 1_000_000_000:.1f}B"
-    if n >= 1_000_000:
+    if n >= 999_950:
         return f"{n / 1_000_000:.1f}M"
     if n >= 1_000:
         return f"{n / 1_000:.1f}k"
     return str(n)
 
 
-def main():
+def track_transcript(tp, api_ms):
+    """增量读取 transcript，维护单会话缓存，返回统计字典。
+
+    返回键：total_out（transcript 累计 output）、turn_out/turn_ms（本轮）、
+    avg_out（本进程内新增的 output，配合 api_ms 算平均）。
+    """
+    key = hashlib.sha256(tp.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    cache_path = os.path.join(CACHE_DIR, key + ".json")
+    state = load_cache(cache_path)
+    fresh = "base_api_ms" not in state
+    dirty = False
     try:
-        data = json.load(sys.stdin)
-    except ValueError:
+        size = os.path.getsize(tp)
+        if size < state["offset"]:
+            state = {"offset": 0, "msgs": {}}
+            fresh = True
+            dirty = True
+        new_prompt = base_at_prompt = None
+        # scan_new 会就地更新 msgs：先记下扫描前总量，才能判断本块内
+        # 新提问前有没有「旧轮次」输出，并让 base_api_ms 与 base_out 对齐同一时刻。
+        prev_out = sum(state["msgs"].values())
+        if size != state["offset"]:
+            offset, new_prompt, base_at_prompt = scan_new(
+                tp, state["offset"], state["msgs"]
+            )
+            if offset != state["offset"]:
+                state["offset"] = offset
+                dirty = True
+        total_out = sum(state["msgs"].values())
+
+        if fresh:
+            # 首次见到这份 transcript：无从得知已有输出对应多少 api 时长，
+            # 只能以此刻为基线。api_ms 为 0 说明本进程还没产出过任何东西，
+            # 已有内容必然是历史（--resume），平均速度也要从此刻起算。
+            state["base_api_ms"] = api_ms
+            state["base_out"] = total_out
+            state["avg_base_out"] = total_out if api_ms == 0 else 0
+            if new_prompt:
+                state["prompt"] = new_prompt
+            dirty = True
+        else:
+            last_api = state.get("last_api_ms", state["base_api_ms"])
+            base_api = state["base_api_ms"]
+            if api_ms < last_api or api_ms < base_api:
+                # total_api_duration_ms 是每个 Claude Code 进程各自累计的，
+                # 回退（或异常缓存里 api_ms < base_api_ms）说明会话被
+                # --resume/重启过，而 transcript 仍含历史输出：基线和平均
+                # 口径都改到「本进程」。
+                if base_at_prompt is not None and base_at_prompt == prev_out:
+                    # 本块先出现新提问、其后才是本进程输出：耗时从 0 起算，
+                    # 输出基线取提问前总量（与 last_api/0 对齐同一时刻）。
+                    state["base_api_ms"] = 0
+                    state["base_out"] = prev_out
+                    state["avg_base_out"] = prev_out
+                elif base_at_prompt is None:
+                    # 无新提问（恢复后直接续跑/审批工具）：本块新增输出属于
+                    # 本进程，不能划进 avg_base_out；耗时同样从 0 起算。
+                    state["base_api_ms"] = 0
+                    state["base_out"] = prev_out
+                    state["avg_base_out"] = prev_out
+                else:
+                    # 本块在新提问前还混有旧轮次输出：无法拆分耗时，退到
+                    # 「此刻」对齐，避免虚高/虚低。
+                    state["base_api_ms"] = api_ms
+                    state["base_out"] = total_out
+                    state["avg_base_out"] = total_out
+                if new_prompt:
+                    state["prompt"] = new_prompt
+                dirty = True
+            elif new_prompt and new_prompt != state.get("prompt"):
+                # 新一轮开始：base_api_ms 与 base_out 必须对应同一时间点。
+                # 同一块里 prompt 之后的 assistant 输出属于本轮。
+                state["prompt"] = new_prompt
+                prompt_base = (
+                    base_at_prompt if base_at_prompt is not None else total_out
+                )
+                if api_ms == last_api:
+                    # api 时长尚未计入本块新输出：两者都停在提问时刻。
+                    state["base_api_ms"] = api_ms
+                    state["base_out"] = prompt_base
+                elif prompt_base == prev_out:
+                    # api 已增长，但提问前无旧轮次输出：增长来自本轮首条回复，
+                    # 基线应回到增长前的 (last_api, prev_out)。
+                    state["base_api_ms"] = last_api
+                    state["base_out"] = prompt_base
+                else:
+                    # 本块混杂旧轮次输出：无法归因，退到此刻对齐。
+                    state["base_api_ms"] = api_ms
+                    state["base_out"] = total_out
+                dirty = True
+        if state.get("last_api_ms") != api_ms:
+            state["last_api_ms"] = api_ms
+            dirty = True
+        if dirty:
+            try:
+                save_cache(cache_path, state)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+    total_out = sum(state["msgs"].values())
+    if "base_api_ms" not in state:
+        return {"total_out": total_out or None}
+    return {
+        "total_out": total_out,
+        "turn_out": total_out - state["base_out"],
+        "turn_ms": api_ms - state["base_api_ms"],
+        "avg_out": max(total_out - state.get("avg_base_out", 0), 0),
+    }
+
+
+def main():
+    _force_utf8_stdio()
+    data = _read_stdin_json()
+    if not isinstance(data, dict):
         return
 
     tp = data.get("transcript_path")
-    cost = data.get("cost") or {}
-    ctx = data.get("context_window") or {}
-    model = (data.get("model") or {}).get("display_name") or ""
+    cost = _dict(data.get("cost"))
+    ctx = _dict(data.get("context_window"))
+    name = _dict(data.get("model")).get("display_name")
+    model = name if isinstance(name, str) else ""
 
-    api_ms = cost.get("total_api_duration_ms") or 0
-    total_out = None
-    turn_out = turn_ms = None
+    api_raw = cost.get("total_api_duration_ms")
+    api_ms = api_raw if _is_num(api_raw) and api_raw > 0 else 0
 
-    if tp and os.path.isfile(tp):
-        key = hashlib.sha256(tp.encode()).hexdigest()[:16]
-        cache_path = os.path.join(CACHE_DIR, key + ".json")
-        state = load_cache(cache_path)
+    stats = {}
+    if isinstance(tp, str) and tp:
+        tp = os.path.expanduser(tp)
         try:
-            size = os.path.getsize(tp)
-            if size < state["offset"]:
-                state = {"offset": 0, "msgs": {}}
-            dirty = False
-            if size != state["offset"]:
-                offset, new_prompt = scan_new(tp, state["offset"], state["msgs"])
-                if offset != state["offset"]:
-                    state["offset"] = offset
-                    dirty = True
-                total_now = sum(state["msgs"].values())
-                if new_prompt and new_prompt != state.get("prompt"):
-                    # 新一轮开始：以本刻的 api 时长和输出总量作为基线
-                    state["prompt"] = new_prompt
-                    state["base_api_ms"] = api_ms
-                    state["base_out"] = total_now
-                    dirty = True
-            total_out = sum(state["msgs"].values())
-            if "base_api_ms" not in state:
-                state["base_api_ms"] = api_ms
-                state["base_out"] = total_out
-                dirty = True
-            if dirty:
-                save_cache(cache_path, state)
-            turn_out = total_out - state.get("base_out", 0)
-            turn_ms = api_ms - state.get("base_api_ms", api_ms)
-        except OSError:
-            total_out = sum(state["msgs"].values()) if state.get("msgs") else None
+            if os.path.isfile(tp):
+                stats = track_transcript(tp, api_ms)
+        except Exception:
+            stats = {}
+
+    total_out = stats.get("total_out")
+    turn_out = stats.get("turn_out")
+    turn_ms = stats.get("turn_ms")
+    avg_out = stats.get("avg_out", total_out)
 
     if total_out is None:
-        total_out = ctx.get("total_output_tokens") or 0
+        fallback = ctx.get("total_output_tokens")
+        total_out = fallback if _is_int(fallback) and fallback > 0 else 0
+        avg_out = total_out
 
     today_tokens = reset_tokens = None
     try:
@@ -578,8 +792,8 @@ def main():
     # 本轮刚起步（不足 TURN_MIN_MS）或还没产出时整段不显示：
     # 每轮开头先闪一个 "--" 纯属噪声。
 
-    if api_ms > 0 and total_out:
-        parts.append(f"平均 {total_out / (api_ms / 1000):.1f} tok/s")
+    if api_ms > 0 and avg_out:
+        parts.append(f"平均 {avg_out / (api_ms / 1000):.1f} tok/s")
 
     parts.append(f"{fmt_tokens(total_out)} out")
     if today_tokens is not None:
@@ -587,7 +801,7 @@ def main():
         parts.append(f"自重置 {fmt_tokens(reset_tokens)} tok")
 
     used = ctx.get("used_percentage")
-    if isinstance(used, (int, float)):
+    if _is_num(used):
         parts.append(f"ctx {used:.0f}%")
 
     if model:
@@ -597,6 +811,7 @@ def main():
 
 
 if __name__ == "__main__":
+    _force_utf8_stdio()
     if len(sys.argv) > 1 and sys.argv[1] == "--reset":
         reset_usage()
     elif len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
