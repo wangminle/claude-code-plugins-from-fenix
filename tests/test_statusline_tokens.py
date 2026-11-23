@@ -531,5 +531,70 @@ class TestBug012UsageTotalsResilience(Base):
             self.m.datetime.datetime = orig
 
 
+class TestBug013AverageSpeedResilience(Base):
+    def test_first_turn_streaming_with_zero_api_ms_not_treated_as_history(self):
+        self.append(user_line("p1"), assistant_line("m1", 200))
+        out = self.render(0)
+        self.assertIn("200 out", out)
+        self.assertNotIn("平均", out)
+        self.append(assistant_line("m1", 250))
+        out = self.render(5_000)
+        self.assertIn("本轮 50.0 tok/s", out)
+        self.assertIn("平均 50.0 tok/s", out)
+
+    def test_fresh_multi_turn_history_with_zero_api_ms_treated_as_resume(self):
+        self.append(
+            user_line("p1"),
+            assistant_line("m1", 5000),
+            user_line("p2"),
+            assistant_line("m2", 3000),
+        )
+        out = self.render(0)
+        self.assertIn("8.0k out", out)
+        self.append(user_line("p3"), assistant_line("m3", 100))
+        out = self.render(2_000)
+        self.assertIn("平均 50.0 tok/s", out)
+
+    def test_transient_empty_cost_frame_does_not_corrupt_baselines(self):
+        self.append(assistant_line("m1", 5000))
+        self.assertIn("平均 50.0 tok/s", self.render(100_000))
+        # 瞬时缺少 cost / api_ms=0 的渲染帧不得重置基线
+        out = self.run_main({"transcript_path": self.transcript})
+        self.assertIn("5.0k out", out)
+        self.append(assistant_line("m2", 100))
+        out = self.render(102_000)
+        self.assertIn("本轮 50.0 tok/s", out)
+        self.assertIn("平均 50.0 tok/s", out)
+
+    def test_stale_concurrent_refresh_does_not_trigger_reset(self):
+        self.append(assistant_line("m1", 5000))
+        self.render(100_000)
+        self.append(assistant_line("m2", 100))
+        self.assertIn("平均 50.0 tok/s", self.render(102_000))
+        # 并发乱序：旧的 100s 帧晚于 102s 帧到达
+        self.render(100_000)
+        self.append(assistant_line("m3", 100))
+        out = self.render(104_000)
+        self.assertIn("本轮 50.0 tok/s", out)
+        self.assertIn("平均 50.0 tok/s", out)
+
+    def test_resume_mixed_chunk_pairs_avg_base_api_ms(self):
+        self.append(user_line("p1"), assistant_line("m1", 5000))
+        self.render(60_000)
+        # 恢复时同一块里既含旧轮尾部输出，又含新提问与回复 -> 触发 else 对齐此刻
+        self.append(
+            assistant_line("m1_tail", 500),
+            user_line("p2"),
+            assistant_line("m2", 500),
+        )
+        out = self.render(20_000)
+        self.assertNotIn("平均", out)
+        # 后续新增 500 tok / 10s：分母应扣掉 20s，算得 50.0 tok/s 而非 16.7 tok/s
+        self.append(assistant_line("m3", 500))
+        out = self.render(30_000)
+        self.assertIn("平均 50.0 tok/s", out)
+        self.assertNotIn("平均 16.7 tok/s", out)
+
+
 if __name__ == "__main__":
     unittest.main()

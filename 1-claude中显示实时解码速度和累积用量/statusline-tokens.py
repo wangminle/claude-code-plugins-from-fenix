@@ -225,6 +225,8 @@ def load_cache(path):
         state["last_api_ms"] = d["last_api_ms"]
     if _is_int(d.get("avg_base_out")) and d["avg_base_out"] >= 0:
         state["avg_base_out"] = d["avg_base_out"]
+    if _is_num(d.get("avg_base_api_ms")) and d["avg_base_api_ms"] >= 0:
+        state["avg_base_api_ms"] = d["avg_base_api_ms"]
     return state
 
 
@@ -633,13 +635,14 @@ def track_transcript(tp, api_ms):
     """增量读取 transcript，维护单会话缓存，返回统计字典。
 
     返回键：total_out（transcript 累计 output）、turn_out/turn_ms（本轮）、
-    avg_out（本进程内新增的 output，配合 api_ms 算平均）。
+    avg_out/avg_ms（本进程或对齐窗口内新增的 output 与耗时，用于算平均）。
     """
     key = hashlib.sha256(tp.encode("utf-8", "surrogatepass")).hexdigest()[:16]
     cache_path = os.path.join(CACHE_DIR, key + ".json")
     state = load_cache(cache_path)
     fresh = "base_api_ms" not in state
     dirty = False
+    skip_save = False
     try:
         size = os.path.getsize(tp)
         if size < state["offset"]:
@@ -660,40 +663,76 @@ def track_transcript(tp, api_ms):
         total_out = sum(state["msgs"].values())
 
         if fresh:
-            # 首次见到这份 transcript：无从得知已有输出对应多少 api 时长，
-            # 只能以此刻为基线。api_ms 为 0 说明本进程还没产出过任何东西，
-            # 已有内容必然是历史（--resume），平均速度也要从此刻起算。
-            state["base_api_ms"] = api_ms
-            state["base_out"] = total_out
-            state["avg_base_out"] = total_out if api_ms == 0 else 0
+            # 首次见到这份 transcript：
+            # - api_ms == 0 且处于首轮流式阶段（没有更早的历史消息）：output 属于
+            #   即将完成的首条 API 请求，不能吞进历史基线；
+            # - api_ms == 0 且已有历史多轮/多条消息：视为 --resume 初启，基线从此刻起算；
+            # - api_ms > 0：本轮从此刻起算，平均从 (0, 0) 起算。
+            if api_ms == 0:
+                is_first_turn_stream = (
+                    base_at_prompt == 0
+                    or (base_at_prompt is None and len(state["msgs"]) <= 1)
+                )
+                base_out = 0 if is_first_turn_stream else total_out
+                state["base_api_ms"] = 0
+                state["base_out"] = base_out
+                state["avg_base_api_ms"] = 0
+                state["avg_base_out"] = base_out
+            else:
+                state["base_api_ms"] = api_ms
+                state["base_out"] = total_out
+                state["avg_base_api_ms"] = 0
+                state["avg_base_out"] = 0
             if new_prompt:
                 state["prompt"] = new_prompt
             dirty = True
         else:
             last_api = state.get("last_api_ms", state["base_api_ms"])
             base_api = state["base_api_ms"]
-            if api_ms < last_api or api_ms < base_api:
+            avg_base_api = state.get("avg_base_api_ms", 0)
+            if api_ms == 0 and last_api > 0:
+                # 瞬时空 cost 帧或 --resume 首帧：绝不覆写已存基线，也不写盘；
+                # 仅返回实时 total_out，等下一个有效 api_ms 再判定是否续跑或重启。
+                skip_save = True
+                return {
+                    "total_out": total_out,
+                    "turn_out": 0,
+                    "turn_ms": 0,
+                    "avg_out": 0,
+                    "avg_ms": 0,
+                }
+            if (
+                api_ms < last_api
+                and total_out == prev_out
+                and new_prompt is None
+                and api_ms > last_api * 0.5
+            ):
+                # 并发乱序的旧刷新帧（无新输出、api_ms 仅小幅落后于已落盘新帧）：
+                # 不触发 reset，也不覆写缓存。
+                skip_save = True
+            elif (
+                api_ms < last_api
+                or api_ms < base_api
+                or api_ms < avg_base_api
+            ):
                 # total_api_duration_ms 是每个 Claude Code 进程各自累计的，
-                # 回退（或异常缓存里 api_ms < base_api_ms）说明会话被
-                # --resume/重启过，而 transcript 仍含历史输出：基线和平均
-                # 口径都改到「本进程」。
+                # 回退（或异常缓存里 api_ms < 基线）说明会话被 --resume/重启过，
+                # 基线和平均口径都改到「本进程」，分子与分母成对重置。
                 if base_at_prompt is not None and base_at_prompt == prev_out:
-                    # 本块先出现新提问、其后才是本进程输出：耗时从 0 起算，
-                    # 输出基线取提问前总量（与 last_api/0 对齐同一时刻）。
                     state["base_api_ms"] = 0
                     state["base_out"] = prev_out
+                    state["avg_base_api_ms"] = 0
                     state["avg_base_out"] = prev_out
                 elif base_at_prompt is None:
-                    # 无新提问（恢复后直接续跑/审批工具）：本块新增输出属于
-                    # 本进程，不能划进 avg_base_out；耗时同样从 0 起算。
                     state["base_api_ms"] = 0
                     state["base_out"] = prev_out
+                    state["avg_base_api_ms"] = 0
                     state["avg_base_out"] = prev_out
                 else:
-                    # 本块在新提问前还混有旧轮次输出：无法拆分耗时，退到
-                    # 「此刻」对齐，避免虚高/虚低。
+                    # 本块在新提问前还混有旧轮次输出：分子与分母同时对齐到「此刻」。
                     state["base_api_ms"] = api_ms
                     state["base_out"] = total_out
+                    state["avg_base_api_ms"] = api_ms
                     state["avg_base_out"] = total_out
                 if new_prompt:
                     state["prompt"] = new_prompt
@@ -719,14 +758,15 @@ def track_transcript(tp, api_ms):
                     state["base_api_ms"] = api_ms
                     state["base_out"] = total_out
                 dirty = True
-        if state.get("last_api_ms") != api_ms:
-            state["last_api_ms"] = api_ms
-            dirty = True
-        if dirty:
-            try:
-                save_cache(cache_path, state)
-            except OSError:
-                pass
+        if not skip_save:
+            if state.get("last_api_ms") != api_ms:
+                state["last_api_ms"] = api_ms
+                dirty = True
+            if dirty:
+                try:
+                    save_cache(cache_path, state)
+                except OSError:
+                    pass
     except OSError:
         pass
 
@@ -738,6 +778,7 @@ def track_transcript(tp, api_ms):
         "turn_out": total_out - state["base_out"],
         "turn_ms": api_ms - state["base_api_ms"],
         "avg_out": max(total_out - state.get("avg_base_out", 0), 0),
+        "avg_ms": api_ms - state.get("avg_base_api_ms", 0),
     }
 
 
@@ -769,11 +810,13 @@ def main():
     turn_out = stats.get("turn_out")
     turn_ms = stats.get("turn_ms")
     avg_out = stats.get("avg_out", total_out)
+    avg_ms = stats.get("avg_ms", api_ms)
 
     if total_out is None:
         fallback = ctx.get("total_output_tokens")
         total_out = fallback if _is_int(fallback) and fallback > 0 else 0
         avg_out = total_out
+        avg_ms = api_ms
 
     today_tokens = reset_tokens = None
     try:
@@ -792,8 +835,8 @@ def main():
     # 本轮刚起步（不足 TURN_MIN_MS）或还没产出时整段不显示：
     # 每轮开头先闪一个 "--" 纯属噪声。
 
-    if api_ms > 0 and avg_out:
-        parts.append(f"平均 {avg_out / (api_ms / 1000):.1f} tok/s")
+    if avg_ms is not None and avg_ms > 0 and avg_out:
+        parts.append(f"平均 {avg_out / (avg_ms / 1000):.1f} tok/s")
 
     parts.append(f"{fmt_tokens(total_out)} out")
     if today_tokens is not None:
