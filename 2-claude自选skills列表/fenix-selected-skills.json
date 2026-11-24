@@ -1,0 +1,464 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-11-24",
+  "notes": [
+    "安装只拉取 skills[].path 指向的子目录（git blobless + sparse checkout），不会下载整个仓库。",
+    "path 为空或为 \".\" 表示技能位于仓库根目录；此时无法只取子目录，安装会整仓浅克隆，脚本会提示。",
+    "check --network 只读取每个 skill 的 SKILL.md 做校验，不下载仓库。",
+    "sync 先检查目标目录：缺失则安装最新版；已存在则核对目录名、SKILL.md 的 name 与版本，过旧则更新；非本工具安装的目录会先备份到 <目标目录>/.backups/。",
+    "默认安装到用户级 ~/.claude/skills；--target project 安装到当前目录的 .claude/skills，--target <目录> 可指定任意位置。",
+    "平台：macOS / Linux / WSL 使用 fenix-selected-skills.sh；Windows 使用 fenix-selected-skills.ps1 或 fenix-selected-skills.cmd；脚本会自动检测环境并切换对应实现。"
+  ],
+  "skills": [
+    {
+      "type": "文档处理",
+      "name": "docx",
+      "repo": "anthropics/skills",
+      "path": "skills/docx",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "创建、读取、编辑 Word 文档（含修订与批注）",
+      "checked_at": "2026-11-24 11:51"
+    },
+    {
+      "type": "文档处理",
+      "name": "pdf",
+      "repo": "anthropics/skills",
+      "path": "skills/pdf",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "PDF 读取、合并拆分、表单与水印",
+      "checked_at": "2026-11-24 11:41"
+    },
+    {
+      "type": "文档处理",
+      "name": "pptx",
+      "repo": "anthropics/skills",
+      "path": "skills/pptx",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "生成与编辑 PowerPoint 演示文稿",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "文档处理",
+      "name": "xlsx",
+      "repo": "anthropics/skills",
+      "path": "skills/xlsx",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "读写 Excel 表格、公式与图表",
+      "checked_at": "2026-11-24 11:36"
+    },
+    {
+      "type": "文档处理",
+      "name": "docx-to-markdown",
+      "repo": "wangminle/skills-doc-to-md",
+      "path": "skills/docx-to-markdown",
+      "version": "d2415eb1bbeca039c0a1c218948c692fa4227a85",
+      "version_kind": "commit",
+      "description": "Word 转 Markdown（含嵌入 Excel 表格与图片提取）",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "文档处理",
+      "name": "pdf-markdown-summary",
+      "repo": "wangminle/skills-pdf-markdown-summary",
+      "path": "skills/pdf-markdown-summary",
+      "version": "4922d0ee14a7b234368e4b53fdf799e0e8128b38",
+      "version_kind": "commit",
+      "description": "PDF 转 Markdown 并提取图表做阅读摘要",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "文档处理",
+      "name": "scanned-pdf-editor",
+      "repo": "wangminle/skills-scanned-pdf-editor",
+      "path": "skills/scanned-pdf-editor",
+      "version": "fa4c1ef1dd07f44167850db693c9515e7ea310a3",
+      "version_kind": "commit",
+      "description": "扫描版 PDF 或图片的局部编辑",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "内容抓取",
+      "name": "webpage-to-md",
+      "repo": "wangminle/skills-webpage-to-md",
+      "path": "skills/webpage-to-md",
+      "version": "8e4d8ddabc83aa759df8f95e322a1de7c97c9208",
+      "version_kind": "commit",
+      "description": "网页文章保存为 Markdown 并下载图片到本地",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "内容创作",
+      "name": "doc-coauthoring",
+      "repo": "anthropics/skills",
+      "path": "skills/doc-coauthoring",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "结构化文档协作写作流程",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "内容创作",
+      "name": "internal-comms",
+      "repo": "anthropics/skills",
+      "path": "skills/internal-comms",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "内部沟通文稿（状态报告、通报、FAQ 等）",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "内容创作",
+      "name": "slack-gif-creator",
+      "repo": "anthropics/skills",
+      "path": "skills/slack-gif-creator",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "制作适配 Slack 的动画 GIF",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "内容创作",
+      "name": "algorithmic-art",
+      "repo": "anthropics/skills",
+      "path": "skills/algorithmic-art",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "用 p5.js 生成算法艺术",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "内容创作",
+      "name": "canvas-design",
+      "repo": "anthropics/skills",
+      "path": "skills/canvas-design",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "生成海报、插画等静态视觉作品",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "内容创作",
+      "name": "brand-guidelines",
+      "repo": "anthropics/skills",
+      "path": "skills/brand-guidelines",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "应用 Anthropic 品牌色与版式",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "内容创作",
+      "name": "theme-factory",
+      "repo": "anthropics/skills",
+      "path": "skills/theme-factory",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "为幻灯片、网页、报告套用主题",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "内容创作",
+      "name": "writing-guidelines",
+      "repo": "vercel-labs/agent-skills",
+      "path": "skills/writing-guidelines",
+      "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
+      "version_kind": "commit",
+      "description": "UI 文案与界面写作规范",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "前端开发",
+      "name": "frontend-design",
+      "repo": "anthropics/skills",
+      "path": "skills/frontend-design",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "高质量前端界面与视觉设计",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "前端开发",
+      "name": "web-artifacts-builder",
+      "repo": "anthropics/skills",
+      "path": "skills/web-artifacts-builder",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "构建多组件 Web Artifact",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "前端开发",
+      "name": "webapp-testing",
+      "repo": "anthropics/skills",
+      "path": "skills/webapp-testing",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "用 Playwright 测试本地 Web 应用",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "前端开发",
+      "name": "react-best-practices",
+      "repo": "vercel-labs/agent-skills",
+      "path": "skills/react-best-practices",
+      "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
+      "version_kind": "commit",
+      "description": "React / Next.js 性能最佳实践",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "前端开发",
+      "name": "composition-patterns",
+      "repo": "vercel-labs/agent-skills",
+      "path": "skills/composition-patterns",
+      "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
+      "version_kind": "commit",
+      "description": "React 组合式组件设计模式",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "前端开发",
+      "name": "react-native-skills",
+      "repo": "vercel-labs/agent-skills",
+      "path": "skills/react-native-skills",
+      "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
+      "version_kind": "commit",
+      "description": "React Native / Expo 开发实践",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "前端开发",
+      "name": "react-view-transitions",
+      "repo": "vercel-labs/agent-skills",
+      "path": "skills/react-view-transitions",
+      "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
+      "version_kind": "commit",
+      "description": "React 视图过渡动画",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "前端开发",
+      "name": "web-design-guidelines",
+      "repo": "vercel-labs/agent-skills",
+      "path": "skills/web-design-guidelines",
+      "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
+      "version_kind": "commit",
+      "description": "Web 界面与可访问性规范审查",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "前端开发",
+      "name": "deploy-to-vercel",
+      "repo": "vercel-labs/agent-skills",
+      "path": "skills/deploy-to-vercel",
+      "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
+      "version_kind": "commit",
+      "description": "把项目部署到 Vercel",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "brainstorming",
+      "repo": "obra/superpowers",
+      "path": "skills/brainstorming",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "动工前澄清需求与设计",
+      "checked_at": "2026-11-24 11:36"
+    },
+    {
+      "type": "开发流程",
+      "name": "writing-plans",
+      "repo": "obra/superpowers",
+      "path": "skills/writing-plans",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "编写分步实施计划",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "executing-plans",
+      "repo": "obra/superpowers",
+      "path": "skills/executing-plans",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "按计划执行并在检查点复核",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "test-driven-development",
+      "repo": "obra/superpowers",
+      "path": "skills/test-driven-development",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "先写失败测试再实现",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "systematic-debugging",
+      "repo": "obra/superpowers",
+      "path": "skills/systematic-debugging",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "系统化定位 bug 根因",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "verification-before-completion",
+      "repo": "obra/superpowers",
+      "path": "skills/verification-before-completion",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "声称完成前先跑验证拿证据",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "requesting-code-review",
+      "repo": "obra/superpowers",
+      "path": "skills/requesting-code-review",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "完成后发起代码审查",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "receiving-code-review",
+      "repo": "obra/superpowers",
+      "path": "skills/receiving-code-review",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "严谨处理审查意见而非盲从",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "using-git-worktrees",
+      "repo": "obra/superpowers",
+      "path": "skills/using-git-worktrees",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "用 git worktree 隔离开发",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "subagent-driven-development",
+      "repo": "obra/superpowers",
+      "path": "skills/subagent-driven-development",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "用子代理执行独立任务",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "dispatching-parallel-agents",
+      "repo": "obra/superpowers",
+      "path": "skills/dispatching-parallel-agents",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "并行派发互不依赖的任务",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "finishing-a-development-branch",
+      "repo": "obra/superpowers",
+      "path": "skills/finishing-a-development-branch",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "分支收尾：合并、PR 或清理",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "开发流程",
+      "name": "writing-skills",
+      "repo": "obra/superpowers",
+      "path": "skills/writing-skills",
+      "version": "v7.0.2",
+      "version_kind": "tag",
+      "description": "编写与调试 Skill",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "工程工具",
+      "name": "mcp-builder",
+      "repo": "anthropics/skills",
+      "path": "skills/mcp-builder",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "构建高质量 MCP 服务器",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "工程工具",
+      "name": "skill-creator",
+      "repo": "anthropics/skills",
+      "path": "skills/skill-creator",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "创建、改进与评测 Skill",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "工程工具",
+      "name": "claude-api",
+      "repo": "anthropics/skills",
+      "path": "skills/claude-api",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "Claude API 参考（模型、价格、流式、工具调用）",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "项目管理",
+      "name": "task-list-initialization",
+      "repo": "wangminle/skills-task-list-initialization",
+      "path": "skills/task-list-initialization",
+      "version": "37ca88aba885beb3c70f4307774a7fd0b7779560",
+      "version_kind": "commit",
+      "description": "建立与检查项目任务台账 task-list.md",
+      "checked_at": "2026-11-24 10:31"
+    },
+    {
+      "type": "辅助增强",
+      "name": "academy-guide",
+      "repo": "anthropics/skills",
+      "path": "skills/academy-guide",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "回答问题前推荐 Claude Academy 的课程、教程与用例",
+      "checked_at": "2026-11-24 11:01"
+    },
+    {
+      "type": "辅助增强",
+      "name": "discernment-nudge",
+      "repo": "anthropics/skills",
+      "path": "skills/discernment-nudge",
+      "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
+      "version_kind": "commit",
+      "description": "实质性回答后追加 2~3 个追问，帮用户核对事实、推理与遗漏背景",
+      "checked_at": "2026-11-24 11:01"
+    },
+    {
+      "type": "前端开发",
+      "name": "impeccable",
+      "repo": "pbakaus/impeccable",
+      "path": ".claude/skills/impeccable",
+      "version": "skill-v4.10.0",
+      "version_kind": "tag",
+      "description": "设计、重构、审查、打磨前端界面与设计系统",
+      "checked_at": "2026-11-24 11:51"
+    }
+  ]
+}

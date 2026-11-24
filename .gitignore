@@ -49,6 +49,14 @@ task-list.md
 task-list.md.lock
 task-list-archive-*.md
 
+# ── 自选 skills 名单脚本的产物（--target 指向仓库内时才会出现）──
+# JSON / md 原子写留下的中间文件，进程被中断时可能残留
+fenix-selected-skills.*.tmp.*
+# 安装状态、托管标记与替换前的备份；默认落在 ~/.claude/skills 下
+.skills-manager.json
+.skill-manager.json
+.backups/
+
 # ── Claude Code 本机私有配置（整体不随仓库发布）──────────────
 # 含 settings.json、hooks/ 与个人覆盖文件。注意：这样 clone 下来的人
 # 拿不到 Stop hook，需要自己装；CLAUDE.md 的规则仍会生效。
