@@ -14,7 +14,8 @@
   平均     本会话累计 output tokens ÷ 本会话累计 API 耗时；含工具往返
           等空转，通常低于瞬时速度，当下界看即可。
   N out    本会话 transcript 里累计的 output tokens。
-  今日     本地 0 点至今、所有会话的 input + output + 缓存读写总量。
+  今日     本地 0 点至今、所有会话的 input + output + 缓存读写总量，
+          递归统计子代理的 subagents/*.jsonl。
   自重置   同上口径，起点是最近一次 --reset（没重置过则以首次运行时刻为起点）。
   ctx      context 已用百分比，由 Claude Code 直接传入。
   末尾     当前模型显示名。
@@ -23,15 +24,23 @@
 二、怎么装上
 ═══════════════════════════════════════════════════════════════════
 
-在 ~/.claude/settings.json 里加（路径换成本脚本的实际位置）：
+需要 Python 3.7+，只用标准库。在 ~/.claude/settings.json 里加（路径换成
+本脚本的实际位置；JSON 字符串中的 Windows 反斜杠要写成双反斜杠）：
 
+  macOS / Linux：
   "statusLine": {
     "type": "command",
     "command": "python3 '/绝对/路径/statusline-tokens.py'"
   }
 
+  Windows cmd.exe（双引号；python3 可能命中 Microsoft Store 占位符）：
+  "statusLine": {
+    "type": "command",
+    "command": "python \"C:\\绝对\\路径\\statusline-tokens.py\""
+  }
+
   * 只对终端里的 claude CLI 生效；Claude Desktop 的界面不读这个配置。
-  * 路径含空格或中文时一定要用单引号包住，JSON 里不用转义。
+  * 路径含空格或中文时必须按所用 shell 正确加引号。
   * 想让它每秒重算（默认只在事件发生时刷新）再加 "refreshInterval": 1，
     代价是每秒多起一个 python 进程。
   * 只用标准库。文件锁依赖 Unix 的 fcntl，Windows 上自动退化为不加锁：
@@ -47,7 +56,7 @@
   python3 statusline-tokens.py --help    # 帮助
   python3 statusline-tokens.py           # 正常模式：从 stdin 读 Claude Code 的 JSON
 
-  手动试跑（不看 Claude Code 脸色）：
+  手动试跑（先把 x/y.jsonl 换成真实 transcript 文件名，否则只会显示 0 out）：
 
   echo '{"transcript_path":"~/.claude/projects/x/y.jsonl","cost":{"total_api_duration_ms":5000}}' \\
     | python3 statusline-tokens.py
@@ -59,8 +68,11 @@
   ~/.cache/claude-statusline/usage-index.json   跨会话增量索引（今日/自重置口径）
   ~/.cache/claude-statusline/<hash>.json        单会话缓存（按 transcript 路径哈希）
   ~/.cache/claude-statusline/usage-index.lock   索引写锁
+  ~/.cache/claude-statusline/last-sweep         单会话缓存的每日清理节流标记
   ~/.claude/statusline-usage-reset.json         最近一次 --reset 的时间戳
 
+设置 XDG_CACHE_HOME 时，上述 ~/.cache 替换为该目录。transcript 不可读时，
+N out 回退到 Claude Code 传入的 context_window.total_output_tokens。
 索引只保留「今日」和「自重置」两个窗口仍然需要的记录，更早的每次写回时
 自动裁掉，所以不会随历史无限增长。单会话缓存 30 天没更新会自动清理（每天
 最多扫一次，只清早就不再使用的会话）。删掉 ~/.cache/claude-statusline 不丢
@@ -86,7 +98,7 @@
   显式 UTF-8，stdin/stdout 也强制 UTF-8（Windows 默认 gbk/cp1252 不会崩）。
 * 外部 JSON（stdin、缓存、索引、transcript 行）一律按「形状不对就丢弃」
   处理，bool 不算数字。
-* 统计失败一律吞掉：状态栏宁可少一行，也不能因为算不出数字整行空掉。
+* 统计失败一律吞掉：状态栏宁可少一项指标，也不能因为算不出数字整行空掉。
 """
 
 import datetime
@@ -113,7 +125,7 @@ USAGE_LOCK = os.path.join(CACHE_DIR, "usage-index.lock")
 RESET_FILE = os.path.expanduser("~/.claude/statusline-usage-reset.json")
 TRANSCRIPT_ROOT = os.path.expanduser("~/.claude/projects")
 
-TURN_MIN_MS = 800  # 本轮做过短时速度抖动大，先不显示
+TURN_MIN_MS = 800  # 本轮过短时速度抖动大，先不显示
 
 # 哪些 promptSource 才算「用户开了一轮」。注意系统注入的消息（后台任务完成
 # 通知、跨会话消息、各种提醒）带的是 "system"，它们既不是 isMeta 也不是工具
@@ -296,7 +308,7 @@ def scan_new(path, offset, msgs):
 
 
 def _int(value):
-    return value if _is_int(value) else 0
+    return value if _is_int(value) and value > 0 else 0
 
 
 def parse_ts(value):
@@ -667,7 +679,9 @@ def track_transcript(tp, api_ms):
             # - api_ms == 0 且处于首轮流式阶段（没有更早的历史消息）：output 属于
             #   即将完成的首条 API 请求，不能吞进历史基线；
             # - api_ms == 0 且已有历史多轮/多条消息：视为 --resume 初启，基线从此刻起算；
-            # - api_ms > 0：本轮从此刻起算，平均从 (0, 0) 起算。
+            # - api_ms > 0 且已有历史多消息：api_ms 只属于新进程，历史输出与
+            #   当前耗时同时作为基线，避免拿全历史 token 除以新进程耗时；
+            # - api_ms > 0 且只有当前消息：本轮从此刻起算，平均从 (0, 0) 起算。
             if api_ms == 0:
                 is_first_turn_stream = (
                     base_at_prompt == 0
@@ -678,6 +692,13 @@ def track_transcript(tp, api_ms):
                 state["base_out"] = base_out
                 state["avg_base_api_ms"] = 0
                 state["avg_base_out"] = base_out
+            elif len(state["msgs"]) > 1:
+                # 无缓存恢复一份多消息历史时，api_ms 只属于新进程；把历史输出
+                # 与当前耗时同时作为基线，避免拿全历史 token 除以新进程耗时。
+                state["base_api_ms"] = api_ms
+                state["base_out"] = total_out
+                state["avg_base_api_ms"] = api_ms
+                state["avg_base_out"] = total_out
             else:
                 state["base_api_ms"] = api_ms
                 state["base_out"] = total_out
@@ -748,9 +769,9 @@ def track_transcript(tp, api_ms):
                     # api 时长尚未计入本块新输出：两者都停在提问时刻。
                     state["base_api_ms"] = api_ms
                     state["base_out"] = prompt_base
-                elif prompt_base == prev_out:
-                    # api 已增长，但提问前无旧轮次输出：增长来自本轮首条回复，
-                    # 基线应回到增长前的 (last_api, prev_out)。
+                elif prompt_base == prev_out and total_out > prompt_base:
+                    # api 已增长，提问前无旧轮次输出且本块确有本轮回复：
+                    # 增长来自本轮首条回复，基线回到增长前的同一时刻。
                     state["base_api_ms"] = last_api
                     state["base_out"] = prompt_base
                 else:
@@ -855,10 +876,14 @@ def main():
 
 if __name__ == "__main__":
     _force_utf8_stdio()
-    if len(sys.argv) > 1 and sys.argv[1] == "--reset":
+    if len(sys.argv) == 1:
+        main()
+    elif len(sys.argv) == 2 and sys.argv[1] == "--reset":
         reset_usage()
-    elif len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+    elif len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
         print("用法: statusline-tokens.py [--reset]")
         print("  --reset  将“自重置”token 计数起点设为当前时间")
     else:
-        main()
+        print("用法: statusline-tokens.py [--reset]", file=sys.stderr)
+        print(f"未知参数：{' '.join(sys.argv[1:])}", file=sys.stderr)
+        sys.exit(2)

@@ -1,21 +1,21 @@
 # 自选 Claude Skills 名单
 
 > 本文件由名单脚本（`fenix-selected-skills.sh` / `fenix-selected-skills.ps1`）从 [fenix-selected-skills.json](fenix-selected-skills.json) 自动生成，请勿手改。
-> 安装只拉取 skills[].path 指向的子目录（git blobless + sparse checkout），不会下载整个仓库。
+> 安装只拉取 skills[].path 指向的子目录（git blobless + sparse checkout），先下载并校验到临时目录，成功后才替换旧目录，失败保留原版本。
 > path 为空或为 "." 表示技能位于仓库根目录；此时无法只取子目录，安装会整仓浅克隆，脚本会提示。
 > check --network 只读取每个 skill 的 SKILL.md 做校验，不下载仓库。
-> sync 先检查目标目录：缺失则安装最新版；已存在则核对目录名、SKILL.md 的 name 与版本，过旧则更新；非本工具安装的目录会先备份到 <目标目录>/.backups/。
+> sync 先检查目标目录：缺失则安装最新版；已存在则核对目录名、SKILL.md 的 name 与版本，过旧则更新；内容一致的非托管目录直接纳入管理，内容不同或无法校验时需 --force 才备份到 <目标目录>/.backups/ 后替换；--dry-run 不写文件。
 > 默认安装到用户级 ~/.claude/skills；--target project 安装到当前目录的 .claude/skills，--target <目录> 可指定任意位置。
 > 平台：macOS / Linux / WSL 使用 fenix-selected-skills.sh；Windows 使用 fenix-selected-skills.ps1 或 fenix-selected-skills.cmd；脚本会自动检测环境并切换对应实现。
 
-共 45 项 · 更新于 2026-11-24 13:30
+共 46 项 · 更新于 2026-11-26 16:00
 
-| 类型 | 名称 | GitHub | 仓库路径 | 最新版本 | 说明 |
+| 类型 | 名称 | GitHub | 仓库路径 | 名单版本 | 说明 |
 | --- | --- | --- | --- | --- | --- |
 | 文档处理 | docx | [anthropics/skills](https://github.com/anthropics/skills) | skills/docx | e4bb5d96 | 创建、读取、编辑 Word 文档（含修订与批注） |
 | 文档处理 | docx-to-markdown | [wangminle/skills-doc-to-md](https://github.com/wangminle/skills-doc-to-md) | skills/docx-to-markdown | d2415eb1 | Word 转 Markdown（含嵌入 Excel 表格与图片提取） |
 | 文档处理 | pdf | [anthropics/skills](https://github.com/anthropics/skills) | skills/pdf | e4bb5d96 | PDF 读取、合并拆分、表单与水印 |
-| 文档处理 | pdf-markdown-summary | [wangminle/skills-pdf-markdown-summary](https://github.com/wangminle/skills-pdf-markdown-summary) | skills/pdf-markdown-summary | 4922d0ee | PDF 转 Markdown 并提取图表做阅读摘要 |
+| 文档处理 | pdf-markdown-summary | [wangminle/skills-pdf-markdown-summary](https://github.com/wangminle/skills-pdf-markdown-summary) | skills/pdf-markdown-summary | 53d8294f | PDF 转 Markdown 并提取图表做阅读摘要 |
 | 文档处理 | pptx | [anthropics/skills](https://github.com/anthropics/skills) | skills/pptx | e4bb5d96 | 生成与编辑 PowerPoint 演示文稿 |
 | 文档处理 | scanned-pdf-editor | [wangminle/skills-scanned-pdf-editor](https://github.com/wangminle/skills-scanned-pdf-editor) | skills/scanned-pdf-editor | fa4c1ef1 | 扫描版 PDF 或图片的局部编辑 |
 | 文档处理 | xlsx | [anthropics/skills](https://github.com/anthropics/skills) | skills/xlsx | e4bb5d96 | 读写 Excel 表格、公式与图表 |
@@ -35,6 +35,7 @@
 | 前端开发 | react-best-practices | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) | skills/react-best-practices | 5a37a632 | React / Next.js 性能最佳实践 |
 | 前端开发 | react-native-skills | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) | skills/react-native-skills | 5a37a632 | React Native / Expo 开发实践 |
 | 前端开发 | react-view-transitions | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) | skills/react-view-transitions | 5a37a632 | React 视图过渡动画 |
+| 前端开发 | vercel-optimize | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) | skills/vercel-optimize | 5a37a632 | Vercel 部署项目的成本与性能审计，给出有指标支撑的优化建议 |
 | 前端开发 | web-artifacts-builder | [anthropics/skills](https://github.com/anthropics/skills) | skills/web-artifacts-builder | e4bb5d96 | 构建多组件 Web Artifact |
 | 前端开发 | web-design-guidelines | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) | skills/web-design-guidelines | 5a37a632 | Web 界面与可访问性规范审查 |
 | 前端开发 | webapp-testing | [anthropics/skills](https://github.com/anthropics/skills) | skills/webapp-testing | e4bb5d96 | 用 Playwright 测试本地 Web 应用 |
@@ -58,4 +59,4 @@
 | 辅助增强 | academy-guide | [anthropics/skills](https://github.com/anthropics/skills) | skills/academy-guide | e4bb5d96 | 回答问题前推荐 Claude Academy 的课程、教程与用例 |
 | 辅助增强 | discernment-nudge | [anthropics/skills](https://github.com/anthropics/skills) | skills/discernment-nudge | e4bb5d96 | 实质性回答后追加 2~3 个追问，帮用户核对事实、推理与遗漏背景 |
 
-同步：`fenix-selected-skills.sh sync`（Windows：`fenix-selected-skills.ps1 sync`） · 查状态：`fenix-selected-skills.sh status` · 帮助：`fenix-selected-skills.sh help`
+同步：`fenix-selected-skills.sh sync`（Windows：`fenix-selected-skills.cmd sync`） · 查状态：`fenix-selected-skills.sh status` · 帮助：`fenix-selected-skills.sh help`

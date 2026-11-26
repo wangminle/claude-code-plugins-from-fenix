@@ -596,5 +596,66 @@ class TestBug013AverageSpeedResilience(Base):
         self.assertNotIn("平均 16.7 tok/s", out)
 
 
+class TestBug014TurnAndCliEdges(Base):
+    def test_prompt_without_output_does_not_reuse_previous_turn_api_time(self):
+        self.append(user_line("p1"), assistant_line("a", 100))
+        self.render(1_000)
+        self.append(user_line("p2"))
+        self.render(3_000)
+        self.append(assistant_line("b", 200))
+        out = self.render(5_000)
+        self.assertIn("本轮 100.0 tok/s", out)
+        self.assertNotIn("本轮 50.0 tok/s", out)
+
+    def test_fresh_resume_with_history_does_not_inflate_average(self):
+        self.append(
+            user_line("p1"),
+            assistant_line("a", 5000),
+            user_line("p2"),
+            assistant_line("b", 3000),
+        )
+        out = self.render(2_000)
+        self.assertNotIn("平均", out)
+        state = self.cache_state()
+        self.assertEqual(state["avg_base_out"], 8000)
+        self.assertEqual(state["avg_base_api_ms"], 2000)
+        self.append(assistant_line("c", 100))
+        out = self.render(4_000)
+        self.assertIn("平均 50.0 tok/s", out)
+
+    def test_unknown_arguments_exit_without_reading_stdin(self):
+        proc = subprocess.run(
+            [sys.executable, SCRIPT, "--rest"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("用法", proc.stderr.decode("utf-8"))
+        self.assertIn("--rest", proc.stderr.decode("utf-8"))
+
+    def test_negative_usage_fields_do_not_cancel_output(self):
+        line = json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": "2026-11-26T10:00:00Z",
+                "message": {
+                    "id": "negative",
+                    "usage": {
+                        "input_tokens": -100,
+                        "output_tokens": 10,
+                        "cache_creation_input_tokens": -20,
+                        "cache_read_input_tokens": -30,
+                    },
+                },
+            }
+        )
+        self.append(line)
+        _, msgs, _ = self.m.scan_usage_file(
+            self.transcript, {"offset": 0, "msgs": {}}
+        )
+        self.assertEqual(msgs["negative"][1], 10)
+
+
 if __name__ == "__main__":
     unittest.main()

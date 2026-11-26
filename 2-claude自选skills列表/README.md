@@ -22,7 +22,7 @@ A single JSON list of the Claude Code skills worth installing, plus a pair of sc
 | --- | --- |
 | macOS | `git`, `jq` (`brew install git jq`); `curl` for `check --network` |
 | Debian / Ubuntu / WSL | `git`, `jq`, `curl` (`sudo apt-get install -y git jq curl`) |
-| Windows | Git for Windows (provides `git`), PowerShell 5.1+; `jq` |
+| Windows | Git for Windows (provides `git`), PowerShell 5.1+; no `jq` required |
 
 `env` prints what is present and what is missing, and warns if the shell script itself was checked out with CRLF line endings.
 
@@ -46,10 +46,10 @@ On Windows:
 
 | Command | What it does |
 | --- | --- |
-| `sync [names...] [--dry-run] [--force] [--target ...]` | Reconcile the target directory with the list. Installs what is missing, updates what is stale, adopts identical unmanaged copies, backs up differing unmanaged copies. |
+| `sync [names...] [--dry-run] [--force] [--target ...]` | Reconcile the target directory with the list. Installs what is missing, updates what is stale, adopts identical unmanaged copies, and replaces differing unmanaged copies only with `--force` (after backup). Writes versions to the JSON and generated Markdown; `--dry-run` writes nothing. |
 | `install [names...] [--force] [--target ...]` | Install the version pinned in the JSON. Skips directories this tool did not create unless `--force` is given. |
-| `update [names...] [--target ...]` | Query GitHub and reinstall managed skills that have a newer version. Defaults to everything recorded in the state file. |
-| `status [--target ...]` | Show installed version, latest known version and state for every entry. |
+| `update [names...] [--target ...]` | Query GitHub, reinstall managed skills that have a newer version or whose directory is missing, and write versions to the JSON and generated Markdown. Defaults to everything recorded in the state file. |
+| `status [--target ...]` | Without network access, compare installed versions with the versions recorded in the JSON. Distinguishes missing directories from unmanaged ones. |
 | `list` | Print the list as a table. |
 | `render` | Regenerate `fenix-selected-skills.md`. |
 | `refresh [names...]` | Query GitHub and write the current versions back into the JSON. Defaults to all entries. |
@@ -79,7 +79,7 @@ Each target keeps its own state file, so a user-level and a project-level instal
 ## How installation works
 
 1. The skill's `path` in its repository is sparse-checked-out with `git clone --depth 1 --filter=blob:none --sparse`, so only that sub-directory is transferred. Root-level skills (`path` empty or `.`) fall back to a shallow clone of the whole repository, and the script says so.
-2. The downloaded directory must contain `SKILL.md`, otherwise the install fails with a path hint.
+2. Downloading and validation happen in a staging directory on the target filesystem. The old directory is moved aside only after the staged copy contains `SKILL.md`; replacement or state-write failure restores the old version.
 3. Directories created by this tool are recognised by the state file and a `.skill-manager.json` marker inside each skill directory; they are replaced in place on update.
 4. A same-named directory that this tool did not create is left untouched unless `--force` is passed. `sync` backs it up to `<target>/.backups/<name>-<timestamp>` before replacing it; it is adopted without a copy when its `SKILL.md` is byte-identical to the remote one. `install --force` replaces it without a backup, so prefer `sync --force` when you want one.
 
@@ -94,7 +94,7 @@ Each target keeps its own state file, so a user-level and a project-level instal
 
 The two scripts are ports of each other with identical commands and flags, and they hand work to the right one automatically:
 
-- `fenix-selected-skills.sh` under Git Bash / MSYS / Cygwin re-executes `fenix-selected-skills.ps1` when `powershell.exe` is available.
+- `fenix-selected-skills.sh` under Git Bash / MSYS / Cygwin re-executes `fenix-selected-skills.ps1`, preferring `pwsh.exe` over `powershell.exe` and converting the script path with `cygpath -w` when available.
 - `fenix-selected-skills.ps1` outside Windows hands over to `fenix-selected-skills.sh` when `bash` is available.
 
 So the same command line works in any shell on any of the supported systems.
@@ -107,7 +107,7 @@ So the same command line works in any shell on any of the supported systems.
 ./fenix-selected-skills.sh sync my-skill
 ```
 
-Names must be lowercase letters, digits and hyphens. `repo` must be `owner/name`. `path` is relative to the repository root and may not contain `..`.
+Names must be lowercase letters, digits and hyphens. `repo` must be `owner/name`. `path` is relative to the repository root, uses forward slashes, and may not contain a `..` path component, backslashes, an absolute path or a drive prefix.
 
 ## JSON shape
 
@@ -133,10 +133,24 @@ Names must be lowercase letters, digits and hyphens. `repo` must be `owner/name`
 
 ## Caveats
 
-- The list contains 45 entries across nine categories; the Markdown table is sorted by a fixed category order, then by name.
-- `jq` is required for every command except `help` and `env`.
+- The list contains 46 entries across eight categories; the Markdown table is sorted by a fixed category order, then by name.
+- The Bash implementation requires `jq` for every command except `help` and `env`; the PowerShell implementation uses built-in JSON cmdlets and does not require `jq`.
 - `check --network` reads only `SKILL.md` files, with a fallback from `raw.githubusercontent.com` to the GitHub API, so a blocked raw host does not fail the run.
-- Git operations retry on transient network errors; a failing entry during a batch run is reported and skipped rather than aborting the whole run.
+- Git operations retry on transient network errors. A failing entry during a batch run is reported without preventing later entries; `install` returns a non-zero status if any installation fails.
+- Git always runs non-interactively (`GIT_TERMINAL_PROMPT=0`): a private or missing repository fails fast instead of waiting at a username/password prompt.
+- Repository paths are normalized (`./skills/x/`, `skills//x`, `skills/x/.` all become `skills/x`); absolute paths and `..` are rejected, and a malformed `skills` array (non-object entries) fails every command with a clear error.
+
+## Testing
+
+`tests/test_fenix_selected_skills.py` runs the installer end to end against a temporary local git remote (run the commands from the repository root):
+
+```bash
+python3 -m pytest tests/test_fenix_selected_skills.py -q                    # local Bash (3.2 / 5.x)
+FENIX_TEST_DOCKER_BASH=1 python3 -m pytest tests/test_fenix_selected_skills.py -q -k DockerBash
+FENIX_TEST_DOCKER_PWSH=1 python3 -m pytest tests/test_fenix_selected_skills.py -q -k PowerShell
+```
+
+The Docker images need `git`, `jq` and `curl`. If `fenix-selected-skills-bash:test` / `fenix-selected-skills-pwsh:test` are missing, the tests build them once from `tests/Dockerfile.bash` / `tests/Dockerfile.pwsh` (skipped with `FENIX_NO_DOCKER_BUILD=1` when offline); `FENIX_BASH_IMAGE` / `FENIX_PWSH_IMAGE` override the image tags.
 
 ---
 
@@ -164,7 +178,7 @@ Names must be lowercase letters, digits and hyphens. `repo` must be `owner/name`
 | --- | --- |
 | macOS | `git`、`jq`（`brew install git jq`）；`check --network` 另需 `curl` |
 | Debian / Ubuntu / WSL | `git`、`jq`、`curl`（`sudo apt-get install -y git jq curl`） |
-| Windows | Git for Windows（提供 `git`）、PowerShell 5.1+；`jq` |
+| Windows | Git for Windows（提供 `git`）、PowerShell 5.1+；不需要 `jq` |
 
 `env` 会列出已安装与缺失的依赖，并在 shell 脚本自身带有 CRLF 换行时告警。
 
@@ -188,10 +202,10 @@ Windows 下：
 
 | 命令 | 作用 |
 | --- | --- |
-| `sync [名称...] [--dry-run] [--force] [--target ...]` | 把目标目录对齐到名单：缺的装、旧的更新、内容一致的非托管目录直接纳入管理、内容不同的先备份再替换。 |
+| `sync [名称...] [--dry-run] [--force] [--target ...]` | 把目标目录对齐到名单：缺的装、旧的更新、内容一致的非托管目录直接纳入管理；内容不同的非托管目录只有加 `--force` 才备份替换。版本会写回 JSON 和生成的 Markdown，`--dry-run` 不写任何文件。 |
 | `install [名称...] [--force] [--target ...]` | 按 JSON 中锁定的版本安装；非本工具创建的同名目录默认跳过，`--force` 才覆盖。 |
-| `update [名称...] [--target ...]` | 查询 GitHub，重装已托管且有新版本的技能；默认处理状态文件中的全部条目。 |
-| `status [--target ...]` | 逐条显示已安装版本、名单版本与状态。 |
+| `update [名称...] [--target ...]` | 查询 GitHub，重装已托管且有新版本或目录缺失的技能，并把版本写回 JSON 和生成的 Markdown；默认处理状态文件中的全部条目。 |
+| `status [--target ...]` | 不联网，逐条比较已安装版本与 JSON 名单记录版本；区分目录缺失与非托管目录。 |
 | `list` | 以表格打印名单。 |
 | `render` | 重新生成 `fenix-selected-skills.md`。 |
 | `refresh [名称...]` | 查询 GitHub 并把当前版本写回 JSON，默认处理全部条目。 |
@@ -221,7 +235,7 @@ Windows 下：
 ## 安装行为
 
 1. 用 `git clone --depth 1 --filter=blob:none --sparse` 只取仓库中 `path` 指向的子目录；只有 `path` 为空或 `.`（技能在仓库根目录）时才退回整仓浅克隆，并会给出提示。
-2. 下载内容必须包含 `SKILL.md`，否则安装失败并提示检查 `path`。
+2. 先在目标文件系统的暂存目录中下载并校验；暂存内容包含 `SKILL.md` 后才移开旧目录。替换或状态写入失败会恢复原版本。
 3. 本工具创建的目录通过状态文件与技能目录内的 `.skill-manager.json` 标记识别，更新时就地替换。
 4. 非本工具创建的同名目录默认不动，加 `--force` 才处理：`sync` 会先备份到 `<目标目录>/.backups/<名称>-<时间>` 再替换；若其 `SKILL.md` 与远端逐字节一致，则直接纳入管理、不产生备份。`install --force` 不做备份直接替换，需要备份请用 `sync --force`。
 
@@ -236,7 +250,7 @@ Windows 下：
 
 两个脚本的命令与参数完全一致，并会自动转交：
 
-- Git Bash / MSYS / Cygwin 下运行 `fenix-selected-skills.sh`，若找到 `powershell.exe` 会自动改跑 `fenix-selected-skills.ps1`；
+- Git Bash / MSYS / Cygwin 下运行 `fenix-selected-skills.sh` 会自动改跑 `fenix-selected-skills.ps1`，优先 `pwsh.exe`、回退 `powershell.exe`，并在可用时用 `cygpath -w` 转换脚本路径；
 - 非 Windows 环境运行 `fenix-selected-skills.ps1`，若找到 `bash` 会自动改跑 `fenix-selected-skills.sh`。
 
 所以同一条命令在任意受支持系统的任意 shell 里都能直接使用。
@@ -249,7 +263,7 @@ Windows 下：
 ./fenix-selected-skills.sh sync my-skill
 ```
 
-名称只允许小写字母、数字与连字符；`repo` 必须是 `owner/name`；`path` 相对仓库根目录且不能包含 `..`。
+名称只允许小写字母、数字与连字符；`repo` 必须是 `owner/name`；`path` 必须相对仓库根目录并使用正斜杠，不能包含 `..` 路径段、反斜杠、绝对路径或盘符。
 
 ## JSON 结构
 
@@ -275,7 +289,23 @@ Windows 下：
 
 ## 注意事项
 
-- 目前共 45 项、九个分类；Markdown 表格按固定的分类顺序排序，同类别内按名称排序。
-- 除 `help` 与 `env` 外，所有命令都依赖 `jq`。
+- 目前共 46 项、8 个分类；Markdown 表格按固定的分类顺序排序，同类别内按名称排序。
+- Bash 版除 `help` 与 `env` 外都依赖 `jq`；PowerShell 版使用内置 JSON 命令，不依赖 `jq`。
 - `check --network` 只读取各技能的 `SKILL.md`，在 `raw.githubusercontent.com` 不可达时会回退到 GitHub API，因此 raw 域名被阻断不会导致检查失败。
-- git 操作对偶发网络错误会重试；批量执行时单项失败只告警并继续，不会中断整批。
+- git 操作对偶发网络错误会重试；批量执行时单项失败会告警并继续处理后续条目，`install` 在任一安装失败时返回非零状态。
+- git 始终非交互执行（`GIT_TERMINAL_PROMPT=0`）：仓库私有或不存在时立即报错，不会卡在账号密码提示。
+- 仓库路径会自动归一化（`./skills/x/`、`skills//x`、`skills/x/.` 都按 `skills/x` 处理）；绝对路径与 `..` 会被拒绝，`skills` 数组里出现非对象条目时所有命令都会明确报错。
+
+## 回归测试
+
+`tests/test_fenix_selected_skills.py` 用临时本地 git 仓库端到端验证安装器（在仓库根目录运行）：
+
+```bash
+python3 -m pytest tests/test_fenix_selected_skills.py -q                    # 本机 Bash（3.2 / 5.x）
+FENIX_TEST_DOCKER_BASH=1 python3 -m pytest tests/test_fenix_selected_skills.py -q -k DockerBash
+FENIX_TEST_DOCKER_PWSH=1 python3 -m pytest tests/test_fenix_selected_skills.py -q -k PowerShell
+```
+
+Docker 镜像需要 `git`、`jq`、`curl`；`fenix-selected-skills-bash:test` / `fenix-selected-skills-pwsh:test`
+不存在时会按 `tests/Dockerfile.bash` / `tests/Dockerfile.pwsh` 自动构建一次（离线时可用
+`FENIX_NO_DOCKER_BUILD=1` 跳过）；也可用 `FENIX_BASH_IMAGE` / `FENIX_PWSH_IMAGE` 指定镜像。

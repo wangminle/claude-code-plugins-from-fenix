@@ -12,7 +12,8 @@
 #                            按名单当前版本安装；默认跳过非托管同名目录
 #   update [名称...] [--target ...]
 #                            已安装技能有新版则重装（默认所有已安装项）
-#   status [--target ...]    查看安装状态与最新版本
+#   status [--target ...]    查看安装状态与名单记录版本（不联网）
+#   env                      打印平台、依赖与目标目录
 #   check [--network]        校验 fenix-selected-skills.json（--network 额外验证仓库路径可访问）
 #   add --name N --type T --repo O/R [--path P] [--desc D] [--no-refresh]
 #                            追加条目并刷新版本
@@ -28,6 +29,14 @@
 # 版本口径：仓库有语义化 tag 取最新 tag，否则取默认分支 HEAD 提交 SHA。
 
 set -euo pipefail
+# macOS Bash 3.2 在不支持的 C.UTF-8 locale 下会把中文标点误并入变量名。
+export LC_ALL=C
+# 仓库私有或不存在时禁止 git 在终端等待账号密码（脚本场景直接失败而不是卡住）。
+export GIT_TERMINAL_PROMPT=0
+
+# 字段分隔符：Bash 的 read 只会折叠空白类 IFS 字符，
+# 用 \x1f（单元分隔符）拼接字段可保证空字段不会被后面的值挤掉。
+IFS_SEP=$'\x1f'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_FILE="$SCRIPT_DIR/fenix-selected-skills.json"
@@ -40,8 +49,18 @@ TYPE_ORDER='["文档处理","内容抓取","内容创作","前端开发","开发
 # 环境探测：Git Bash / MSYS / Cygwin 下切到 PowerShell 版
 case "$(uname -s 2>/dev/null || echo unknown)" in
   MINGW*|MSYS*|CYGWIN*)
-    if [ -f "$SCRIPT_DIR/fenix-selected-skills.ps1" ] && command -v powershell.exe >/dev/null 2>&1; then
-      exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SCRIPT_DIR/fenix-selected-skills.ps1" "$@"
+    ps_cmd=""
+    if command -v pwsh.exe >/dev/null 2>&1; then
+      ps_cmd="pwsh.exe"
+    elif command -v powershell.exe >/dev/null 2>&1; then
+      ps_cmd="powershell.exe"
+    fi
+    if [ -n "$ps_cmd" ] && [ -f "$SCRIPT_DIR/fenix-selected-skills.ps1" ]; then
+      ps_script="$SCRIPT_DIR/fenix-selected-skills.ps1"
+      if command -v cygpath >/dev/null 2>&1; then
+        ps_script="$(cygpath -w "$ps_script")"
+      fi
+      exec "$ps_cmd" -NoProfile -ExecutionPolicy Bypass -File "$ps_script" "$@"
     fi
     ;;
 esac
@@ -103,6 +122,17 @@ need_curl() {
 }
 require_data() {
   [ -f "$DATA_FILE" ] || die "找不到名单文件：$DATA_FILE"
+  # 结构不对（非 JSON、skills 不是对象数组、字段不是字符串）时让所有命令一致地报错，
+  # 避免 jq 在循环里静默失败被当成「检查通过」，或数字版本被静默当成字符串。
+  jq -e '
+    def s: type == "string" or type == "null";
+    (.skills | type) == "array"
+    and all(.skills[];
+      type == "object"
+      and (.name | s) and (.type | s) and (.repo | s) and (.path | s)
+      and (.version | s) and (.version_kind | s) and (.description | s))
+  ' "$DATA_FILE" >/dev/null 2>&1 \
+    || die "名单文件结构错误：$DATA_FILE（skills 必须是对象数组，字段必须是字符串）"
 }
 
 retry_output() {
@@ -182,6 +212,37 @@ apply_target_arg() {
   STATE_FILE="${SKILLS_STATE_FILE:-$SKILLS_DIR/.skills-manager.json}"
 }
 
+valid_skill_path() {
+  local path="$1"
+  [ -z "$path" ] && return 0
+  case "$path" in
+    /*|..|../*|*/../*|*/..) return 1 ;;
+    *$'\n'*|*$'\r'*|*$'\x1f'*) return 1 ;;
+  esac
+  [[ "$path" != *'\'* ]] && ! [[ "$path" =~ ^[A-Za-z]: ]]
+}
+
+normalize_skill_path() {
+  # 兼容手写/命令行传入的路径写法：去掉开头的 ./、结尾的 /、重复的 / 和内部的 /.
+  # 绝对路径与 .. 原样返回，交给 valid_skill_path 判非法。
+  local p="$1"
+  case "$p" in
+    /*) printf '%s' "$p"; return 0 ;;
+  esac
+  while :; do
+    case "$p" in
+      *//*) p="${p%%//*}/${p#*//}" ;;
+      ./*) p="${p#./}" ;;
+      */./*) p="${p%%/./*}/${p#*/./*}" ;;
+      */) p="${p%/}" ;;
+      */.) p="${p%/.}" ;;
+      *) break ;;
+    esac
+  done
+  [ -n "$p" ] || p="."
+  printf '%s' "$p"
+}
+
 is_managed() {
   local name="$1"
   if [ -f "$STATE_FILE" ] && jq -e --arg n "$name" '.skills[$n] != null' "$STATE_FILE" >/dev/null 2>&1; then
@@ -191,23 +252,41 @@ is_managed() {
 }
 
 installed_version() {
-  # 输出 "kind<TAB>version"；未安装或无法判定时返回 1
+  # 输出 "kind<US>version"（US = \x1f）；目录不存在、未安装或无法判定时返回 1
   local name="$1"
+  [ -d "$SKILLS_DIR/$name" ] || return 1
   if [ -f "$STATE_FILE" ] && jq -e --arg n "$name" '.skills[$n] != null' "$STATE_FILE" >/dev/null 2>&1; then
-    jq -r --arg n "$name" '.skills[$n] | [.version_kind, .version] | @tsv' "$STATE_FILE"
+    jq -r --arg n "$name" '.skills[$n]
+      | [(.version_kind // ""), (.version // "")] | join("\u001f")' "$STATE_FILE"
     return 0
   fi
   if [ -f "$SKILLS_DIR/$name/.skill-manager.json" ]; then
-    jq -r '[.version_kind, .version] | @tsv' "$SKILLS_DIR/$name/.skill-manager.json" 2>/dev/null || return 1
+    jq -r '[(.version_kind // ""), (.version // "")] | join("\u001f")' \
+      "$SKILLS_DIR/$name/.skill-manager.json" 2>/dev/null || return 1
     return 0
   fi
   return 1
 }
 
 read_skill_name() {
-  # 读取 SKILL.md frontmatter 的 name
+  # 只读取文件首部 YAML frontmatter 中的 name，并去掉引号与首尾空白
   [ -f "$1" ] || return 0
-  awk -F': *' '/^name:/ { print $2; exit }' "$1" | tr -d '"' | tr -d '\r'
+  awk '
+    NR == 1 { if ($0 != "---" && $0 != "---\r") exit; next }
+    NR > 40 || /^---\r?$/ { exit }
+    /^name:/ {
+      value = $0
+      sub(/^name:[ \t]*/, "", value)
+      gsub(/^[ \t]+|[ \t\r]+$/, "", value)
+      first = substr(value, 1, 1)
+      last = substr(value, length(value), 1)
+      if (length(value) >= 2 && ((first == "\"" && last == "\"") || (first == "\047" && last == "\047"))) {
+        value = substr(value, 2, length(value) - 2)
+      }
+      print value
+      exit
+    }
+  ' "$1"
 }
 
 start_cache() {
@@ -235,11 +314,16 @@ resolve_version_cached() {
 
 render_table() {
   jq -r --arg host "$GITHUB" --argjson order "$TYPE_ORDER" '
-    (["| 类型 | 名称 | GitHub | 仓库路径 | 最新版本 | 说明 |",
+    def cell: tostring | gsub("\r\n|\r|\n"; " ") | gsub("\\|"; "\\|");
+    def normpath: (. // "") | gsub("^(\\./)+"; "") | gsub("/+$"; "")
+      | gsub("/{2,}"; "/") | gsub("/\\./"; "/") | gsub("/\\.$"; "")
+      | if . == "" then "." else . end;
+    def pathcell: normpath | if . == "." then "—" else cell end;
+    (["| 类型 | 名称 | GitHub | 仓库路径 | 名单版本 | 说明 |",
       "| --- | --- | --- | --- | --- | --- |"] +
      [.skills
       | sort_by([(.type as $t | ($order | index($t)) // 99), .name])[]
-      | "| \(.type) | \(.name) | [\(.repo)](\($host)/\(.repo)) | \(if (.path // "") == "" or .path == "." then "—" else .path end) | \(if .version_kind == "commit" then .version[0:8] else .version end) | \(.description // "") |"
+      | "| \(.type | cell) | \(.name | cell) | [\(.repo)](\($host)/\(.repo)) | \((.path // "") | pathcell) | \(if .version_kind == "commit" then (.version // "")[0:8] else (.version // "") end) | \((.description // "") | cell) |"
      ]) | .[]
   ' "$DATA_FILE"
 }
@@ -252,19 +336,65 @@ render_md() {
     jq -r '(.notes // [])[] | "> \(.)"' "$DATA_FILE"
     printf '\n共 %s 项 · 更新于 %s\n\n' "$(count_skills)" "$(date '+%Y-%m-%d %H:%M')"
     render_table
-    printf '\n同步：`fenix-selected-skills.sh sync`（Windows：`fenix-selected-skills.ps1 sync`） · 查状态：`fenix-selected-skills.sh status` · 帮助：`fenix-selected-skills.sh help`\n'
+    printf '\n同步：`fenix-selected-skills.sh sync`（Windows：`fenix-selected-skills.cmd sync`） · 查状态：`fenix-selected-skills.sh status` · 帮助：`fenix-selected-skills.sh help`\n'
   } > "$tmp" && mv "$tmp" "$MD_FILE"
   ok "已生成 $MD_FILE"
 }
 
+latest_semver_tag() {
+  LC_ALL=C awk '
+    function numcmp(a, b) {
+      sub(/^0+/, "", a); sub(/^0+/, "", b)
+      if (a == "") a = "0"
+      if (b == "") b = "0"
+      if (length(a) != length(b)) return length(a) - length(b)
+      if (("x" a) == ("x" b)) return 0
+      return (("x" a) > ("x" b)) ? 1 : -1
+    }
+    function newer(major, minor, patch, pre,    c, na, nb, i, a, b, an, bn) {
+      c = numcmp(major, best_major); if (c != 0) return c > 0
+      c = numcmp(minor, best_minor); if (c != 0) return c > 0
+      c = numcmp(patch, best_patch); if (c != 0) return c > 0
+      if (pre == "" && best_pre != "") return 1
+      if (pre != "" && best_pre == "") return 0
+      if (pre == "") return 0
+      na = split(pre, a, "."); nb = split(best_pre, b, ".")
+      for (i = 1; i <= na && i <= nb; i++) {
+        an = (a[i] ~ /^[0-9]+$/); bn = (b[i] ~ /^[0-9]+$/)
+        if (an && bn) c = numcmp(a[i], b[i])
+        else if (an != bn) c = an ? -1 : 1
+        else if (("x" a[i]) != ("x" b[i])) c = (("x" a[i]) > ("x" b[i])) ? 1 : -1
+        else c = 0
+        if (c != 0) return c > 0
+      }
+      return na > nb
+    }
+    {
+      tag = $0
+      if (!match(tag, /[0-9]+\.[0-9]+\.[0-9]+/)) next
+      base = substr(tag, RSTART, RLENGTH)
+      rest = substr(tag, RSTART + RLENGTH)
+      pre = (rest ~ /^-/) ? substr(rest, 2) : ""
+      sub(/\+.*$/, "", pre)
+      split(base, number, ".")
+      if (best == "" || newer(number[1], number[2], number[3], pre)) {
+        best = tag
+        best_major = number[1]; best_minor = number[2]; best_patch = number[3]
+        best_pre = pre
+      }
+    }
+    END { if (best != "") print best }
+  '
+}
+
 resolve_version() {
-  # 输出 "tag<TAB>版本" 或 "commit<TAB>完整SHA"
+  # 输出 "tag<TAB>版本" 或 "commit<TAB>完整SHA"；前缀不参与 SemVer 大小比较
   local repo="$1" tags sha
   tags="$(retry_output 3 git ls-remote --tags --refs "$GITHUB/$repo.git" \
     | sed 's#.*refs/tags/##' \
     | grep -E '^([A-Za-z][A-Za-z0-9._-]*-)?v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?(\+[0-9A-Za-z.]+)?$' || true)"
   if [ -n "$tags" ]; then
-    printf 'tag\t%s\n' "$(printf '%s\n' "$tags" | sort -V | tail -n 1)"
+    printf 'tag\t%s\n' "$(printf '%s\n' "$tags" | latest_semver_tag)"
     return 0
   fi
   sha="$(retry_output 3 git ls-remote "$GITHUB/$repo.git" HEAD | cut -f1)"
@@ -366,47 +496,47 @@ fetch_repo() {
 
 install_one() {
   local name="$1" force="$2" backup="${3:-0}"
-  local repo path ver kind desc target src tmp fields backup_dir
+  local repo path ver kind target src tmp fields backup_dir old_dest now staged managed
   if ! [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-    die "名称不合法：$name（只允许小写字母、数字、连字符）"
+    err "名称不合法：$name（只允许小写字母、数字、连字符）"
+    return 1
   fi
   if ! jq -e --arg n "$name" 'any(.skills[]; .name == $n)' "$DATA_FILE" >/dev/null 2>&1; then
-    die "名单中没有「$name」"
+    err "名单中没有「$name」"
+    return 1
   fi
   fields="$(jq -r --arg n "$name" '.skills[] | select(.name == $n)
-    | [.repo, (.path // ""), .version, .version_kind, (.description // "")] | @tsv' "$DATA_FILE")"
-  IFS=$'\t' read -r repo path ver kind desc <<< "$fields"
-  case "$path" in
-    /*|*"/../"*|".."*|*"/..") die "$name：path 不合法（$path）" ;;
-  esac
-  if ! [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-    die "$name：repo 不合法（$repo）"
+    | [(.repo // ""), (if (.path // "") == "" then "." else .path end),
+       (.version // ""), (.version_kind // "")]
+    | map(tostring | gsub("[\u001f\n\r]"; "\\n")) | join("\u001f")' "$DATA_FILE")"
+  IFS="$IFS_SEP" read -r repo path ver kind <<< "$fields"
+  path="$(normalize_skill_path "$path")"
+  if ! valid_skill_path "$path"; then
+    err "$name：path 不合法（$path）"
+    return 1
   fi
-  if [ -z "$path" ] || [ "$path" = "." ]; then
+  if ! [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    err "$name：repo 不合法（$repo）"
+    return 1
+  fi
+  if [ -z "$ver" ]; then
+    err "$name：版本为空，先运行 refresh $name"
+    return 1
+  fi
+  if [ "$path" = "." ]; then
     warn "$name：技能位于仓库根目录，无法只取子目录，将下载整个仓库"
   fi
 
   target="$SKILLS_DIR/$name"
-  if [ -e "$target" ] || [ -L "$target" ]; then
-    if is_managed "$name"; then
-      rm -rf "$target"
-    elif [ "$force" = "1" ]; then
-      if [ "$backup" = "1" ]; then
-        backup_dir="$SKILLS_DIR/.backups/$name-$(date '+%Y%m%d-%H%M%S')"
-        mkdir -p "$(dirname "$backup_dir")"
-        mv "$target" "$backup_dir"
-        warn "$name：已备份原目录到 $backup_dir"
-      else
-        warn "$name：覆盖非本工具管理的目录 $target"
-        rm -rf "$target"
-      fi
-    else
-      warn "$name：$target 已存在且不是本工具安装，跳过（--force 可覆盖）"
-      return 0
-    fi
+  managed=0
+  if is_managed "$name"; then managed=1; fi
+  if { [ -e "$target" ] || [ -L "$target" ]; } && [ "$managed" = "0" ] && [ "$force" != "1" ]; then
+    warn "$name：$target 已存在且不是本工具安装，跳过（--force 可覆盖）"
+    return 0
   fi
 
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/claude-skill.XXXXXX")"
+  mkdir -p "$SKILLS_DIR"
+  tmp="$(mktemp -d "$SKILLS_DIR/.install-$name.XXXXXX")"
   TMP_ROOT="$tmp"
   info "$name：下载 $repo@$(fmt_ver "$kind" "$ver")"
   if ! fetch_repo "$repo" "$ver" "$kind" "$tmp/repo" "$path"; then
@@ -417,26 +547,59 @@ install_one() {
   fi
 
   src="$tmp/repo"
-  if [ -n "$path" ] && [ "$path" != "." ]; then
-    src="$tmp/repo/$path"
-  fi
+  if [ "$path" != "." ]; then src="$tmp/repo/$path"; fi
   if [ ! -f "$src/SKILL.md" ]; then
-    err "$name：下载内容缺少 SKILL.md，请检查 path（当前：${path:-.}）"
+    err "$name：下载内容缺少 SKILL.md，请检查 path（当前：$path）"
     rm -rf "$tmp"
     TMP_ROOT=""
     return 1
   fi
 
-  mkdir -p "$SKILLS_DIR" "$target"
-  if [ -n "$path" ] && [ "$path" != "." ]; then
-    cp -R "$src/." "$target/"
+  staged="$tmp/staged"
+  mkdir -p "$staged"
+  if [ "$path" != "." ]; then
+    cp -R "$src/." "$staged/"
   else
-    ( cd "$tmp/repo" && tar --exclude=.git -cf - . ) | ( cd "$target" && tar -xf - )
+    ( cd "$tmp/repo" && tar --exclude=.git -cf - . ) | ( cd "$staged" && tar -xf - )
+  fi
+  now="$(date '+%Y-%m-%d %H:%M')"
+  write_marker "$staged" "$repo" "$path" "$ver" "$kind" "$now"
+
+  old_dest="$tmp/old"
+  backup_dir=""
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    if [ "$managed" = "0" ] && [ "$backup" = "1" ]; then
+      backup_dir="$SKILLS_DIR/.backups/$name-$(date '+%Y%m%d-%H%M%S')-$$"
+      mkdir -p "$(dirname "$backup_dir")"
+      old_dest="$backup_dir"
+    elif [ "$managed" = "0" ]; then
+      warn "$name：覆盖非本工具管理的目录 $target"
+    fi
+    if ! mv "$target" "$old_dest"; then
+      err "$name：无法移走原目录，安装已取消"
+      rm -rf "$tmp"
+      TMP_ROOT=""
+      return 1
+    fi
+    if [ -n "$backup_dir" ]; then warn "$name：已备份原目录到 $backup_dir"; fi
   fi
 
-  local now="$(date '+%Y-%m-%d %H:%M')"
-  save_state_entry "$name" "$repo" "$path" "$ver" "$kind" "$now"
-  write_marker "$target" "$repo" "$path" "$ver" "$kind" "$now"
+  if ! mv "$staged" "$target"; then
+    err "$name：替换目录失败，恢复原目录"
+    if [ -e "$old_dest" ] || [ -L "$old_dest" ]; then mv "$old_dest" "$target" || true; fi
+    rm -rf "$tmp"
+    TMP_ROOT=""
+    return 1
+  fi
+  if ! save_state_entry "$name" "$repo" "$path" "$ver" "$kind" "$now"; then
+    err "$name：状态写入失败，恢复原目录"
+    rm -rf "$target"
+    if [ -e "$old_dest" ] || [ -L "$old_dest" ]; then mv "$old_dest" "$target" || true; fi
+    rm -rf "$tmp"
+    TMP_ROOT=""
+    return 1
+  fi
+  if [ -z "$backup_dir" ] && [ -e "$old_dest" ]; then rm -rf "$old_dest"; fi
 
   rm -rf "$tmp"
   TMP_ROOT=""
@@ -483,7 +646,7 @@ cmd_refresh() {
 }
 
 cmd_install() {
-  local force=0 n names=()
+  local force=0 n failed=0 names=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --force|-f) force=1; shift ;;
@@ -494,14 +657,15 @@ cmd_install() {
     esac
   done
   if [ ${#names[@]} -eq 0 ]; then
-    while IFS= read -r n; do install_one "$n" "$force" || true; done < <(jq -r '.skills[].name' "$DATA_FILE")
+    while IFS= read -r n; do install_one "$n" "$force" || failed=1; done < <(jq -r '.skills[].name' "$DATA_FILE")
   else
-    for n in "${names[@]}"; do install_one "$n" "$force" || true; done
+    for n in "${names[@]}"; do install_one "$n" "$force" || failed=1; done
   fi
+  [ "$failed" = "0" ]
 }
 
 cmd_update() {
-  local names=() n repo latest new_kind new_ver old_ver old_kind inst fields
+  local names=() n repo latest new_kind new_ver old_ver old_kind inst
   while [ $# -gt 0 ]; do
     case "$1" in
       --target) [ $# -ge 2 ] || die "--target 需要参数"; apply_target_arg "$2"; shift 2 ;;
@@ -522,20 +686,25 @@ cmd_update() {
       warn "$n 不在名单中，跳过"
       continue
     fi
-    fields="$(jq -r --arg n "$n" '.skills[] | select(.name == $n) | [.repo] | @tsv' "$DATA_FILE")"
-    IFS=$'\t' read -r repo <<< "$fields"
+    repo="$(jq -r --arg n "$n" '.skills[] | select(.name == $n) | .repo' "$DATA_FILE")"
     if ! latest="$(resolve_version_cached "$repo")"; then
       warn "$n：查询 $repo 失败，跳过"
       continue
     fi
     new_kind="${latest%%$'\t'*}"
     new_ver="${latest#*$'\t'}"
+    if [ ! -d "$SKILLS_DIR/$n" ] && is_managed "$n"; then
+      update_entry_version "$n" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"
+      info "$n：技能目录缺失，按最新版重新安装"
+      install_one "$n" 1 || true
+      continue
+    fi
     if ! inst="$(installed_version "$n")"; then
       warn "$n 尚未安装或没有版本记录，跳过（用 sync）"
       continue
     fi
-    old_kind="${inst%%$'\t'*}"
-    old_ver="${inst#*$'\t'}"
+    old_kind="${inst%%"$IFS_SEP"*}"
+    old_ver="${inst#*"$IFS_SEP"}"
     update_entry_version "$n" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"
     if [ "$new_ver" = "$old_ver" ] && [ "$new_kind" = "$old_kind" ]; then
       ok "$n 已是最新（$(fmt_ver "$new_kind" "$new_ver")）"
@@ -572,15 +741,20 @@ cmd_sync() {
       continue
     fi
     fields="$(jq -r --arg n "$n" '.skills[] | select(.name == $n)
-      | [.repo, (.path // ""), .version, .version_kind] | @tsv' "$DATA_FILE")"
-    IFS=$'\t' read -r repo path ver kind <<< "$fields"
+      | [(.repo // ""), (if (.path // "") == "" then "." else .path end),
+         (.version // ""), (.version_kind // "")]
+      | map(tostring | gsub("[\u001f\n\r]"; "\\n")) | join("\u001f")' "$DATA_FILE")"
+    IFS="$IFS_SEP" read -r repo path ver kind <<< "$fields"
+    path="$(normalize_skill_path "$path")"
     if ! latest="$(resolve_version_cached "$repo")"; then
       warn "$n：查询 $repo 失败，跳过"
       continue
     fi
     new_kind="${latest%%$'\t'*}"
     new_ver="${latest#*$'\t'}"
-    update_entry_version "$n" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"
+    if [ "$dry" != "1" ]; then
+      update_entry_version "$n" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"
+    fi
 
     target="$SKILLS_DIR/$n"
     missing_md=0
@@ -589,7 +763,7 @@ cmd_sync() {
         info "[dry-run] $n：将安装 $(fmt_ver "$new_kind" "$new_ver")"
       else
         info "$n：未安装，安装最新版"
-        install_one "$n" 0 || true
+        install_one "$n" "$force" "$force" || true
       fi
       continue
     fi
@@ -604,8 +778,8 @@ cmd_sync() {
     fi
 
     if inst="$(installed_version "$n")"; then
-      old_kind="${inst%%$'\t'*}"
-      old_ver="${inst#*$'\t'}"
+      old_kind="${inst%%"$IFS_SEP"*}"
+      old_ver="${inst#*"$IFS_SEP"}"
       if [ "$old_ver" = "$new_ver" ] && [ "$old_kind" = "$new_kind" ] && [ "$missing_md" = "0" ]; then
         ok "$n 已是最新（$(fmt_ver "$new_kind" "$new_ver")）"
       elif [ "$dry" = "1" ]; then
@@ -626,6 +800,8 @@ cmd_sync() {
           save_state_entry "$n" "$repo" "$path" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"
           write_marker "$target" "$repo" "$path" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"
         fi
+      elif [ "$force" != "1" ]; then
+        warn "$n：已存在但内容与最新版不同，跳过（--force 可备份并更新）"
       elif [ "$dry" = "1" ]; then
         info "[dry-run] $n：已存在但内容不同，将备份并更新"
       else
@@ -645,10 +821,10 @@ cmd_sync() {
     rm -f "$TMP_FILE"
     TMP_FILE=""
   done
-  touch_updated_at
   if [ "$dry" = "1" ]; then
     info "dry-run 结束，未改动文件"
   else
+    touch_updated_at
     render_md
   fi
 }
@@ -664,30 +840,36 @@ cmd_status() {
     esac
   done
   info "目标目录：$SKILLS_DIR"
-  printf '%-30s %-12s %-12s %s\n' "名称" "已安装" "最新" "状态"
-  while IFS=$'\t' read -r n ver kind; do
+  printf '%-30s %-12s %-12s %s\n' "名称" "已安装" "名单版本" "状态"
+  while IFS="$IFS_SEP" read -r n ver kind; do
     inst="-"
     if iv="$(installed_version "$n")"; then
-      inst="$(printf '%s\n' "$iv" | while IFS=$'\t' read -r ik v; do fmt_ver "$ik" "$v"; done)"
+      inst="$(printf '%s\n' "$iv" | while IFS="$IFS_SEP" read -r ik v; do fmt_ver "$ik" "$v"; done)"
     fi
     if [ "$inst" = "-" ]; then
-      st="未安装"
+      if [ -e "$SKILLS_DIR/$n" ] || [ -L "$SKILLS_DIR/$n" ]; then st="未托管"; else st="未安装"; fi
     elif [ "$inst" = "$(fmt_ver "$kind" "$ver")" ]; then
       st="已最新"
     else
       st="可更新"
     fi
     printf '%-30s %-12s %-12s %s\n' "$n" "$inst" "$(fmt_ver "$kind" "$ver")" "$st"
-  done < <(jq -r '.skills[] | [.name, .version, .version_kind] | @tsv' "$DATA_FILE")
+  done < <(jq -r '.skills[] | [(.name // ""), (.version // ""), (.version_kind // "")]
+    | map(tostring | gsub("[\u001f\n\r]"; "\\n")) | join("\u001f")' "$DATA_FILE")
 }
 
 network_check() {
-  local fail name code
+  local fail name code error_before="$errors"
   info "并发检查 $(count_skills) 个远端 SKILL.md…"
-  fail="$(jq -r '.skills[] | [.name, .repo, (.path // ""), .version] | @tsv' "$DATA_FILE" \
-    | xargs -P 8 -n 4 bash -c '
+  fail="$(jq -rj '
+      def normpath: (. // "") | gsub("^(\\./)+"; "") | gsub("/+$"; "")
+        | gsub("/{2,}"; "/") | gsub("/\\./"; "/") | gsub("/\\.$"; "")
+        | if . == "" then "." else . end;
+      .skills[] | [(.name // ""), (.repo // ""), (.path | normpath), (.version // "")]
+      | .[] | . + "\u0000"' "$DATA_FILE" \
+    | xargs -0 -P 8 -n 4 bash -c '
         name="$1"; repo="$2"; path="$3"; ver="$4"
-        if [ -n "$path" ] && [ "$path" != "." ]; then
+        if [ "$path" != "." ]; then
           raw="https://raw.githubusercontent.com/$repo/$ver/$path/SKILL.md"
           api="repos/$repo/contents/$path/SKILL.md?ref=$ver"
         else
@@ -696,6 +878,8 @@ network_check() {
         fi
         code=$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 10 \
           --retry 1 --retry-delay 1 "$raw" 2>/dev/null || true)
+        [ -n "$code" ] || code=000
+        raw_code="$code"
         if [ "$code" != "200" ]; then
           # raw.githubusercontent.com 在部分网络下不可达，回退到 GitHub API
           if command -v gh >/dev/null 2>&1 && gh api "$api" >/dev/null 2>&1; then
@@ -704,6 +888,8 @@ network_check() {
             code=$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 10 \
               -H "Accept: application/vnd.github+json" "https://api.github.com/$api" 2>/dev/null || true)
             [ -n "$code" ] || code=000
+            # API 也不可达时保留 raw 的真实状态码（如 404），不要退化成 000
+            if [ "$code" = "000" ] && [ "$raw_code" != "000" ]; then code="$raw_code"; fi
           fi
         fi
         [ "$code" = "200" ] || printf "%s\t%s\n" "$name" "$code"
@@ -721,13 +907,13 @@ network_check() {
   fi
   if [ "$net_fail" -gt 0 ]; then
     warn "$net_fail 项因网络不可达未验证；网络恢复后重跑 check --network"
-  else
+  elif [ "$errors" -eq "$error_before" ]; then
     ok "远端检查通过：$(count_skills) 项均可访问"
   fi
 }
 
 cmd_check() {
-  local network=0 a errors=0 net_fail=0 name type repo path ver kind dups net_note
+  local network=0 a errors=0 net_fail=0 name type repo path ver kind dups net_note=""
   for a in "$@"; do
     case "$a" in
       --network) network=1 ;;
@@ -743,7 +929,8 @@ cmd_check() {
     errors=$((errors + 1))
   fi
 
-  while IFS=$'\t' read -r name type repo path ver kind; do
+  while IFS="$IFS_SEP" read -r name type repo path ver kind; do
+    path="$(normalize_skill_path "$path")"
     if ! [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
       err "名称不合法（需小写字母/数字/连字符）：$name"
       errors=$((errors + 1))
@@ -756,10 +943,10 @@ cmd_check() {
       err "$name：repo 需为 owner/name（当前：$repo）"
       errors=$((errors + 1))
     fi
-    case "$path" in
-      /*) err "$name：path 不能是绝对路径（$path）"; errors=$((errors + 1)) ;;
-      *"/../"*|".."*|*"/..") err "$name：path 不能包含 ..（$path）"; errors=$((errors + 1)) ;;
-    esac
+    if ! valid_skill_path "$path"; then
+      err "$name：path 必须是相对路径、使用正斜杠且不能包含 ..（$path）"
+      errors=$((errors + 1))
+    fi
     if [ -z "$ver" ]; then
       err "$name：version 为空（先运行 ./fenix-selected-skills.sh refresh $name）"
       errors=$((errors + 1))
@@ -768,7 +955,9 @@ cmd_check() {
       err "$name：version_kind 只能是 tag 或 commit（当前：$kind）"
       errors=$((errors + 1))
     fi
-  done < <(jq -r '.skills[] | [.name, .type, .repo, (.path // ""), .version, .version_kind] | @tsv' "$DATA_FILE")
+  done < <(jq -r '.skills[] | [(.name // ""), (.type // ""), (.repo // ""),
+      (if (.path // "") == "" then "." else .path end), (.version // ""), (.version_kind // "")]
+    | map(tostring | gsub("[\u001f\n\r]"; "\\n")) | join("\u001f")' "$DATA_FILE")
 
   if [ "$network" = "1" ]; then
     need_curl
@@ -790,21 +979,20 @@ cmd_add() {
   local name="" type="" repo="" path="." desc="" do_refresh=1 a
   while [ $# -gt 0 ]; do
     case "$1" in
-      --name) name="${2:-}"; shift 2 ;;
-      --type) type="${2:-}"; shift 2 ;;
-      --repo) repo="${2:-}"; shift 2 ;;
-      --path) path="${2:-}"; shift 2 ;;
-      --desc) desc="${2:-}"; shift 2 ;;
+      --name) [ $# -ge 2 ] || die "--name 需要参数"; name="$2"; shift 2 ;;
+      --type) [ $# -ge 2 ] || die "--type 需要参数"; type="$2"; shift 2 ;;
+      --repo) [ $# -ge 2 ] || die "--repo 需要参数"; repo="$2"; shift 2 ;;
+      --path) [ $# -ge 2 ] || die "--path 需要参数"; path="$2"; shift 2 ;;
+      --desc) [ $# -ge 2 ] || die "--desc 需要参数"; desc="$2"; shift 2 ;;
       --no-refresh) do_refresh=0; shift ;;
       *) die "未知参数：$1" ;;
     esac
   done
   [ -n "$name" ] && [ -n "$type" ] && [ -n "$repo" ] || die "add 需要 --name、--type、--repo"
+  path="$(normalize_skill_path "$path")"
   [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "名称不合法：$name（只允许小写字母、数字、连字符）"
   [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo 不合法：$repo（需 owner/name）"
-  case "$path" in
-    /*|*"/../"*|".."*|*"/..") die "path 不合法：$path" ;;
-  esac
+  valid_skill_path "$path" || die "path 不合法：$path（需相对路径、正斜杠且不能包含 ..）"
   if jq -e --arg n "$name" 'any(.skills[]; .name == $n)' "$DATA_FILE" >/dev/null 2>&1; then
     die "名单中已有「$name」"
   fi
@@ -820,6 +1008,7 @@ cmd_add() {
     cmd_refresh "$name"
   else
     warn "未刷新版本，运行 ./fenix-selected-skills.sh refresh $name 补全"
+    touch_updated_at
     render_md
   fi
 }
@@ -833,6 +1022,7 @@ cmd_remove() {
   local tmp="$DATA_FILE.tmp.$$"
   jq --arg n "$name" '.skills |= map(select(.name != $n))' "$DATA_FILE" > "$tmp" && mv "$tmp" "$DATA_FILE"
   ok "已从名单移除 $name（已安装目录 $SKILLS_DIR/$name 未删除）"
+  touch_updated_at
   render_md
 }
 
@@ -873,15 +1063,16 @@ cmd_help() {
                                        按名单当前版本安装，默认跳过非托管同名目录
   ./fenix-selected-skills.sh update [名称...] [--target ...]
                                        已安装项有新版则重装
-  ./fenix-selected-skills.sh status [--target ...]    安装状态与最新版本
+  ./fenix-selected-skills.sh status [--target ...]    安装状态与名单记录版本（不联网）
   ./fenix-selected-skills.sh env                      打印环境信息（平台 / 依赖 / 目标目录）
   ./fenix-selected-skills.sh list                     打印名单表格
   ./fenix-selected-skills.sh render                   重新生成 fenix-selected-skills.md
   ./fenix-selected-skills.sh refresh [名称...]         查询并写回最新版本（默认全部）
   ./fenix-selected-skills.sh check [--network]        校验名单；--network 验证远端 SKILL.md
-  ./fenix-selected-skills.sh add --name N --type T --repo O/R [--path P] [--desc D]
-                                       追加条目
+  ./fenix-selected-skills.sh add --name N --type T --repo O/R [--path P] [--desc D] [--no-refresh]
+                                       追加条目（--no-refresh 暂不查询版本）
   ./fenix-selected-skills.sh remove <名称>             从名单移除（不删已安装目录）
+  ./fenix-selected-skills.sh help                     显示本帮助
 
 示例：
   ./fenix-selected-skills.sh sync                     把用户级目录对齐到最新版
@@ -893,7 +1084,7 @@ cmd_help() {
 
 跨平台：
   macOS / Linux / WSL 使用 fenix-selected-skills.sh；Windows PowerShell 使用 fenix-selected-skills.ps1（或 fenix-selected-skills.cmd）。
-  Git Bash / MSYS 下运行 fenix-selected-skills.sh 会自动转交 fenix-selected-skills.ps1；
+  Git Bash / MSYS / Cygwin 下运行 fenix-selected-skills.sh 会自动转交 fenix-selected-skills.ps1；
   非 Windows 上运行 fenix-selected-skills.ps1 会自动转交 fenix-selected-skills.sh。
   Windows 需要 Git for Windows；macOS 可用 brew 安装 git/jq/curl；
   Debian/Ubuntu 可用 apt-get 安装 git/jq/curl。
@@ -901,14 +1092,18 @@ cmd_help() {
 路径与依赖：
   目标目录：--target user（默认 ~/.claude/skills）、project（当前目录/.claude/skills）
             或任意目录；CLAUDE_SKILLS_DIR 可覆盖 user
-  状态文件：<目标目录>/.skills-manager.json
+  状态文件：<目标目录>/.skills-manager.json；SKILLS_STATE_FILE 可覆盖
+  path 会自动归一化：去掉开头的 ./、结尾的 /、重复的 / 和内部的 /.
   依赖：git、jq；check --network 另需 curl
 
 下载策略：
+  安装先下载并校验到临时目录，成功后才替换旧目录，失败保留原版本。
   安装只拉取 skills[].path 对应的子目录（git blobless + sparse checkout），
   不会下载整个仓库；仅当 path 为仓库根目录时才整仓浅克隆。
   check --network 只读取各 skill 的 SKILL.md 校验，不下载仓库。
-  sync 更新已有但非本工具安装的同名目录时，会先备份到 <目标目录>/.backups/<名称>-<时间>。
+  sync/update 会联网并把版本写回名单 JSON 和生成的 Markdown；sync --dry-run 不写任何文件。
+  非托管同名目录只有内容与远端一致时才直接纳入管理；内容不同或无法校验时，
+  必须加 --force 才会备份到 <目标目录>/.backups/<名称>-<时间> 后替换。
 EOF
 }
 
@@ -916,10 +1111,10 @@ main() {
   local cmd="${1:-help}"
   shift || true
   case "$cmd" in
-    help|-h|--help) cmd_help ;;
-    env) cmd_env ;;
-    list) need_jq; require_data; cmd_list ;;
-    render) need_jq; require_data; cmd_render ;;
+    help|-h|--help) [ $# -eq 0 ] || die "help 不接受参数"; cmd_help ;;
+    env) [ $# -eq 0 ] || die "env 不接受参数"; cmd_env ;;
+    list) [ $# -eq 0 ] || die "list 不接受参数"; need_jq; require_data; cmd_list ;;
+    render) [ $# -eq 0 ] || die "render 不接受参数"; need_jq; require_data; cmd_render ;;
     refresh) need_jq; need_git; require_data; cmd_refresh "$@" ;;
     sync) need_jq; need_git; require_data; cmd_sync "$@" ;;
     install) need_jq; need_git; require_data; cmd_install "$@" ;;
