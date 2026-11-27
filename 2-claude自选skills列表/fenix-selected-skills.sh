@@ -248,7 +248,12 @@ is_managed() {
   if [ -f "$STATE_FILE" ] && jq -e --arg n "$name" '.skills[$n] != null' "$STATE_FILE" >/dev/null 2>&1; then
     return 0
   fi
-  [ -f "$SKILLS_DIR/$name/.skill-manager.json" ]
+  has_install_marker "$name"
+}
+
+has_install_marker() {
+  local marker="$SKILLS_DIR/$1/.skill-manager.json"
+  [ -f "$marker" ] && jq -e 'type == "object" and .adoption_pending != true' "$marker" >/dev/null 2>&1
 }
 
 installed_version() {
@@ -260,8 +265,24 @@ installed_version() {
       | [(.version_kind // ""), (.version // "")] | join("\u001f")' "$STATE_FILE"
     return 0
   fi
-  if [ -f "$SKILLS_DIR/$name/.skill-manager.json" ]; then
+  if has_install_marker "$name"; then
     jq -r '[(.version_kind // ""), (.version // "")] | join("\u001f")' \
+      "$SKILLS_DIR/$name/.skill-manager.json" 2>/dev/null || return 1
+    return 0
+  fi
+  return 1
+}
+
+installed_source() {
+  local name="$1"
+  [ -d "$SKILLS_DIR/$name" ] || return 1
+  if [ -f "$STATE_FILE" ] && jq -e --arg n "$name" '.skills[$n] != null' "$STATE_FILE" >/dev/null 2>&1; then
+    jq -r --arg n "$name" '.skills[$n]
+      | [(.repo // ""), (.path // "")] | map(tostring) | join("\u001f")' "$STATE_FILE"
+    return 0
+  fi
+  if has_install_marker "$name"; then
+    jq -r '[(.repo // ""), (.path // "")] | map(tostring) | join("\u001f")' \
       "$SKILLS_DIR/$name/.skill-manager.json" 2>/dev/null || return 1
     return 0
   fi
@@ -272,7 +293,12 @@ read_skill_name() {
   # 只读取文件首部 YAML frontmatter 中的 name，并去掉引号与首尾空白
   [ -f "$1" ] || return 0
   awk '
-    NR == 1 { if ($0 != "---" && $0 != "---\r") exit; next }
+    NR == 1 {
+      bom = sprintf("\357\273\277")
+      if (substr($0, 1, 3) == bom) $0 = substr($0, 4)
+      if ($0 != "---" && $0 != "---\r") exit
+      next
+    }
     NR > 40 || /^---\r?$/ { exit }
     /^name:/ {
       value = $0
@@ -370,16 +396,15 @@ latest_semver_tag() {
       return na > nb
     }
     {
-      tag = $0
-      if (!match(tag, /[0-9]+\.[0-9]+\.[0-9]+/)) next
-      base = substr(tag, RSTART, RLENGTH)
-      rest = substr(tag, RSTART + RLENGTH)
-      pre = (rest ~ /^-/) ? substr(rest, 2) : ""
-      sub(/\+.*$/, "", pre)
-      split(base, number, ".")
-      if (best == "" || newer(number[1], number[2], number[3], pre)) {
+      # 输入由 sed 的整标签正则拆成：原标签 major minor patch prerelease。
+      # 整标签匹配让可选前缀取最长，与 PowerShell/.NET 的语义一致。
+      tag = $1
+      if (NF < 4) next
+      pre = $5
+      sub(/^-/, "", pre)
+      if (best == "" || newer($2, $3, $4, pre)) {
         best = tag
-        best_major = number[1]; best_minor = number[2]; best_patch = number[3]
+        best_major = $2; best_minor = $3; best_patch = $4
         best_pre = pre
       }
     }
@@ -392,9 +417,11 @@ resolve_version() {
   local repo="$1" tags sha
   tags="$(retry_output 3 git ls-remote --tags --refs "$GITHUB/$repo.git" \
     | sed 's#.*refs/tags/##' \
-    | grep -E '^([A-Za-z][A-Za-z0-9._-]*-)?v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?(\+[0-9A-Za-z.]+)?$' || true)"
+    | grep -E '^([A-Za-z][A-Za-z0-9._-]*-)?v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' || true)"
   if [ -n "$tags" ]; then
-    printf 'tag\t%s\n' "$(printf '%s\n' "$tags" | latest_semver_tag)"
+    printf 'tag\t%s\n' "$(printf '%s\n' "$tags" | sed -E \
+      's#^([A-Za-z][A-Za-z0-9._-]*-)?v?([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$#& \2 \3 \4 \5#' \
+      | latest_semver_tag)"
     return 0
   fi
   sha="$(retry_output 3 git ls-remote "$GITHUB/$repo.git" HEAD | cut -f1)"
@@ -411,6 +438,13 @@ update_entry_version() {
   ' "$DATA_FILE" > "$tmp" && mv "$tmp" "$DATA_FILE"
 }
 
+restore_entry() {
+  local name="$1" entry="$2" tmp="$DATA_FILE.tmp.$$"
+  jq --arg n "$name" --argjson entry "$entry" '
+    .skills |= map(if .name == $n then $entry else . end)
+  ' "$DATA_FILE" > "$tmp" && mv "$tmp" "$DATA_FILE"
+}
+
 touch_updated_at() {
   local tmp="$DATA_FILE.tmp.$$"
   jq --arg d "$(date +%Y-%m-%d)" '.updated_at = $d' "$DATA_FILE" > "$tmp" && mv "$tmp" "$DATA_FILE"
@@ -418,23 +452,70 @@ touch_updated_at() {
 
 save_state_entry() {
   # save_state_entry <name> <repo> <path> <ver> <kind> <installed_at>
-  local name="$1" repo="$2" path="$3" ver="$4" kind="$5" now="$6" tmp
-  mkdir -p "$(dirname "$STATE_FILE")"
-  [ -f "$STATE_FILE" ] || printf '{"skills":{}}\n' > "$STATE_FILE"
-  tmp="$STATE_FILE.tmp.$$"
-  jq --arg n "$name" --arg r "$repo" --arg p "$path" --arg v "$ver" \
+  local name="$1" repo="$2" path="$3" ver="$4" kind="$5" now="$6" tmp input=/dev/null
+  mkdir -p "$(dirname "$STATE_FILE")" || return 1
+  if [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
+    [ -f "$STATE_FILE" ] || return 1
+    input="$STATE_FILE"
+  fi
+  tmp="$(mktemp "$STATE_FILE.tmp.XXXXXX")" || return 1
+  if jq -es --arg n "$name" --arg r "$repo" --arg p "$path" --arg v "$ver" \
      --arg k "$kind" --arg t "$now" '
+    (.[0] // {}) |
     .skills = (.skills // {}) | .skills[$n] = {
       repo: $r, path: $p, version: $v, version_kind: $k, installed_at: $t
     }
-  ' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  ' "$input" > "$tmp" && mv "$tmp" "$STATE_FILE"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
 }
 
 write_marker() {
-  # write_marker <target> <repo> <path> <ver> <kind> <installed_at>
-  jq -n --arg r "$2" --arg p "$3" --arg v "$4" --arg k "$5" --arg t "$6" \
-    '{repo: $r, path: $p, version: $v, version_kind: $k, installed_at: $t}' \
-    > "$1/.skill-manager.json"
+  local marker="$1/.skill-manager.json" tmp
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  fi
+  tmp="$(mktemp "$marker.tmp.XXXXXX")" || return 1
+  if jq -n --arg r "$2" --arg p "$3" --arg v "$4" --arg k "$5" --arg t "$6" --argjson pending "${7:-false}" \
+    '{repo: $r, path: $p, version: $v, version_kind: $k, installed_at: $t}
+     | if $pending then .adoption_pending = true else . end' \
+    > "$tmp" && mv "$tmp" "$marker"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+adopt_skill() {
+  local name="$1" target="$2" repo="$3" path="$4" ver="$5" kind="$6" now="$7"
+  local marker="$target/.skill-manager.json"
+  if { [ -e "$marker" ] || [ -L "$marker" ]; } &&
+     ! { [ -f "$marker" ] && [ ! -L "$marker" ] && jq -e '.adoption_pending == true' "$marker" >/dev/null 2>&1; }; then
+    err "$name：收编标记路径已被占用（$marker）"
+    return 1
+  fi
+  if ! write_marker "$target" "$repo" "$path" "$ver" "$kind" "$now" true; then
+    err "$name：无法写入收编标记（$marker）"
+    return 1
+  fi
+  if ! save_state_entry "$name" "$repo" "$path" "$ver" "$kind" "$now"; then
+    err "$name：收编状态写入失败（$STATE_FILE）"
+    rm -f "$marker" || err "$name：无法撤销新建标记，请检查 $marker"
+    return 1
+  fi
+}
+
+rollback_install() {
+  local name="$1" target="$2" old_dest="$3" tmp="$4"
+  if [ -e "$old_dest" ] || [ -L "$old_dest" ]; then
+    if [ -e "$target" ] || [ -L "$target" ] || ! mv "$old_dest" "$target"; then
+      err "$name：无法恢复原目录，备份保留在 $old_dest"
+      return 1
+    fi
+  fi
+  rm -rf "$tmp"
 }
 
 fetch_skill_md() {
@@ -466,18 +547,25 @@ fetch_repo() {
   # fetch_repo <repo> <version> <kind> <dest> <path>
   # 只下载所需子目录：大仓库用 blobless + sparse checkout，避免整仓下载。
   # 网络失败自动重试；成功时吞掉 git 的提示，失败时输出最后一次错误。
-  local repo="$1" ver="$2" kind="$3" dest="$4" path="$5" sparse=0 filter=""
+  local repo="$1" ver="$2" kind="$3" dest="$4" path="$5" sparse=0 filter="" expected actual
   if [ -n "$path" ] && [ "$path" != "." ]; then sparse=1; fi
 
   if [ "$kind" = "tag" ]; then
     if [ "$sparse" = "1" ]; then
-      retry_clone "$dest" git -c advice.detachedHead=false clone --quiet --depth 1 \
-        --filter=blob:none --sparse --branch "$ver" "$GITHUB/$repo.git" || return 1
-      retry_git 2 git -C "$dest" sparse-checkout set --no-cone "$path/" || return 1
+      retry_clone "$dest" git -c advice.detachedHead=false clone --quiet --no-checkout --depth 1 \
+        --filter=blob:none --sparse "$GITHUB/$repo.git" || return 1
     else
-      retry_clone "$dest" git -c advice.detachedHead=false clone --quiet --depth 1 \
-        --branch "$ver" "$GITHUB/$repo.git" || return 1
+      retry_clone "$dest" git -c advice.detachedHead=false clone --quiet --no-checkout --depth 1 \
+        "$GITHUB/$repo.git" || return 1
     fi
+    retry_git 3 git -C "$dest" fetch --quiet --depth 1 origin "refs/tags/$ver" || return 1
+    if [ "$sparse" = "1" ]; then
+      retry_git 2 git -C "$dest" sparse-checkout set --no-cone "/$path/" || return 1
+    fi
+    retry_git 2 git -c advice.detachedHead=false -C "$dest" checkout --quiet FETCH_HEAD || return 1
+    expected="$(git -C "$dest" rev-parse 'FETCH_HEAD^{commit}')" || return 1
+    actual="$(git -C "$dest" rev-parse 'HEAD^{commit}')" || return 1
+    [ "$actual" = "$expected" ] || return 1
   else
     rm -rf "$dest"
     git init --quiet "$dest" || return 1
@@ -486,7 +574,7 @@ fetch_repo() {
       git -C "$dest" config remote.origin.promisor true || return 1
       git -C "$dest" config remote.origin.partialclonefilter blob:none || return 1
       git -C "$dest" sparse-checkout init --no-cone >/dev/null 2>&1 || return 1
-      printf '%s/\n' "$path" > "$dest/.git/info/sparse-checkout"
+      printf '/%s/\n' "$path" > "$dest/.git/info/sparse-checkout"
       filter="--filter=blob:none"
     fi
     retry_git 3 git -C "$dest" fetch --quiet --depth 1 $filter origin "$ver" || return 1
@@ -556,17 +644,37 @@ install_one() {
   fi
 
   staged="$tmp/staged"
-  mkdir -p "$staged"
+  if ! mkdir -p "$staged"; then
+    err "$name：无法创建暂存目录，安装已取消"
+    rm -rf "$tmp"; TMP_ROOT=""
+    return 1
+  fi
   if [ "$path" != "." ]; then
-    cp -R "$src/." "$staged/"
-  else
-    ( cd "$tmp/repo" && tar --exclude=.git -cf - . ) | ( cd "$staged" && tar -xf - )
+    if ! cp -R "$src/." "$staged/"; then
+      err "$name：复制到暂存目录失败，原安装保持不变"
+      rm -rf "$tmp"; TMP_ROOT=""
+      return 1
+    fi
+  elif ! ( cd "$tmp/repo" && tar --exclude=.git -cf - . ) | ( cd "$staged" && tar -xf - ); then
+    err "$name：打包复制到暂存目录失败，原安装保持不变"
+    rm -rf "$tmp"; TMP_ROOT=""
+    return 1
+  fi
+  if [ ! -f "$staged/SKILL.md" ]; then
+    err "$name：暂存内容缺少有效 SKILL.md，原安装保持不变"
+    rm -rf "$tmp"; TMP_ROOT=""
+    return 1
   fi
   now="$(date '+%Y-%m-%d %H:%M')"
-  write_marker "$staged" "$repo" "$path" "$ver" "$kind" "$now"
+  if ! write_marker "$staged" "$repo" "$path" "$ver" "$kind" "$now"; then
+    err "$name：暂存标记写入失败，原安装保持不变"
+    rm -rf "$tmp"; TMP_ROOT=""
+    return 1
+  fi
 
   old_dest="$tmp/old"
   backup_dir=""
+  TMP_ROOT=""
   if [ -e "$target" ] || [ -L "$target" ]; then
     if [ "$managed" = "0" ] && [ "$backup" = "1" ]; then
       backup_dir="$SKILLS_DIR/.backups/$name-$(date '+%Y%m%d-%H%M%S')-$$"
@@ -585,18 +693,14 @@ install_one() {
   fi
 
   if ! mv "$staged" "$target"; then
-    err "$name：替换目录失败，恢复原目录"
-    if [ -e "$old_dest" ] || [ -L "$old_dest" ]; then mv "$old_dest" "$target" || true; fi
-    rm -rf "$tmp"
-    TMP_ROOT=""
+    err "$name：替换目录失败"
+    rollback_install "$name" "$target" "$old_dest" "$tmp"
     return 1
   fi
   if ! save_state_entry "$name" "$repo" "$path" "$ver" "$kind" "$now"; then
-    err "$name：状态写入失败，恢复原目录"
-    rm -rf "$target"
-    if [ -e "$old_dest" ] || [ -L "$old_dest" ]; then mv "$old_dest" "$target" || true; fi
-    rm -rf "$tmp"
-    TMP_ROOT=""
+    err "$name：状态写入失败"
+    rm -rf "$target" || err "$name：无法清理新目录 $target"
+    rollback_install "$name" "$target" "$old_dest" "$tmp"
     return 1
   fi
   if [ -z "$backup_dir" ] && [ -e "$old_dest" ]; then rm -rf "$old_dest"; fi
@@ -665,7 +769,8 @@ cmd_install() {
 }
 
 cmd_update() {
-  local names=() n repo latest new_kind new_ver old_ver old_kind inst
+  local names=() n repo path latest new_kind new_ver old_ver old_kind inst source old_repo old_path original fields
+  local failed=0 source_changed=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --target) [ $# -ge 2 ] || die "--target 需要参数"; apply_target_arg "$2"; shift 2 ;;
@@ -684,11 +789,17 @@ cmd_update() {
   for n in "${names[@]}"; do
     if ! jq -e --arg n "$n" 'any(.skills[]; .name == $n)' "$DATA_FILE" >/dev/null 2>&1; then
       warn "$n 不在名单中，跳过"
+      failed=1
       continue
     fi
-    repo="$(jq -r --arg n "$n" '.skills[] | select(.name == $n) | .repo' "$DATA_FILE")"
+    original="$(jq -c --arg n "$n" '.skills[] | select(.name == $n)' "$DATA_FILE")"
+    fields="$(jq -r --arg n "$n" '.skills[] | select(.name == $n)
+      | [(.repo // ""), (.path // "")] | map(tostring) | join("\u001f")' "$DATA_FILE")"
+    IFS="$IFS_SEP" read -r repo path <<< "$fields"
+    path="$(normalize_skill_path "$path")"
     if ! latest="$(resolve_version_cached "$repo")"; then
       warn "$n：查询 $repo 失败，跳过"
+      failed=1
       continue
     fi
     new_kind="${latest%%$'\t'*}"
@@ -696,7 +807,10 @@ cmd_update() {
     if [ ! -d "$SKILLS_DIR/$n" ] && is_managed "$n"; then
       update_entry_version "$n" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"
       info "$n：技能目录缺失，按最新版重新安装"
-      install_one "$n" 1 || true
+      if ! install_one "$n" 1; then
+        restore_entry "$n" "$original"
+        failed=1
+      fi
       continue
     fi
     if ! inst="$(installed_version "$n")"; then
@@ -705,20 +819,37 @@ cmd_update() {
     fi
     old_kind="${inst%%"$IFS_SEP"*}"
     old_ver="${inst#*"$IFS_SEP"}"
+    old_repo=""
+    old_path=""
+    if source="$(installed_source "$n")"; then
+      IFS="$IFS_SEP" read -r old_repo old_path <<< "$source"
+      old_path="$(normalize_skill_path "$old_path")"
+    fi
+    source_changed=0
+    if [ "$old_repo" != "$repo" ] || [ "$old_path" != "$path" ]; then source_changed=1; fi
     update_entry_version "$n" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"
-    if [ "$new_ver" = "$old_ver" ] && [ "$new_kind" = "$old_kind" ]; then
+    if [ "$new_ver" = "$old_ver" ] && [ "$new_kind" = "$old_kind" ] && [ "$source_changed" = "0" ]; then
       ok "$n 已是最新（$(fmt_ver "$new_kind" "$new_ver")）"
     else
-      info "$n：$(fmt_ver "$old_kind" "$old_ver") → $(fmt_ver "$new_kind" "$new_ver")"
-      install_one "$n" 1 || true
+      if [ "$source_changed" = "1" ]; then
+        info "$n：技能来源变化（$old_repo/$old_path → $repo/$path）"
+      else
+        info "$n：$(fmt_ver "$old_kind" "$old_ver") → $(fmt_ver "$new_kind" "$new_ver")"
+      fi
+      if ! install_one "$n" 1; then
+        restore_entry "$n" "$original"
+        failed=1
+      fi
     fi
   done
   touch_updated_at
   render_md
+  [ "$failed" = "0" ]
 }
 
 cmd_sync() {
-  local force=0 dry=0 n repo path ver kind latest new_kind new_ver target sname inst old_kind old_ver fields missing_md
+  local force=0 dry=0 failed=0 n repo path ver kind latest new_kind new_ver target sname inst old_kind old_ver fields missing_md original
+  local source old_repo old_path source_changed=0
   local names=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -738,8 +869,10 @@ cmd_sync() {
   for n in "${names[@]}"; do
     if ! jq -e --arg n "$n" 'any(.skills[]; .name == $n)' "$DATA_FILE" >/dev/null 2>&1; then
       warn "$n 不在名单中，跳过"
+      failed=1
       continue
     fi
+    original="$(jq -c --arg n "$n" '.skills[] | select(.name == $n)' "$DATA_FILE")"
     fields="$(jq -r --arg n "$n" '.skills[] | select(.name == $n)
       | [(.repo // ""), (if (.path // "") == "" then "." else .path end),
          (.version // ""), (.version_kind // "")]
@@ -748,6 +881,7 @@ cmd_sync() {
     path="$(normalize_skill_path "$path")"
     if ! latest="$(resolve_version_cached "$repo")"; then
       warn "$n：查询 $repo 失败，跳过"
+      failed=1
       continue
     fi
     new_kind="${latest%%$'\t'*}"
@@ -759,11 +893,22 @@ cmd_sync() {
     target="$SKILLS_DIR/$n"
     missing_md=0
     if [ ! -d "$target" ]; then
+      if { [ -e "$target" ] || [ -L "$target" ]; } && [ "$force" != "1" ]; then
+        warn "$n：$target 不是目录且未纳入管理，跳过（--force 可备份并替换）"
+        continue
+      fi
       if [ "$dry" = "1" ]; then
-        info "[dry-run] $n：将安装 $(fmt_ver "$new_kind" "$new_ver")"
+        if [ -e "$target" ] || [ -L "$target" ]; then
+          info "[dry-run] $n：同名非目录将备份并替换为 $(fmt_ver "$new_kind" "$new_ver")"
+        else
+          info "[dry-run] $n：将安装 $(fmt_ver "$new_kind" "$new_ver")"
+        fi
       else
-        info "$n：未安装，安装最新版"
-        install_one "$n" "$force" "$force" || true
+        info "$n：目标缺失或不是目录，安装最新版"
+        if ! install_one "$n" "$force" "$force"; then
+          restore_entry "$n" "$original"
+          failed=1
+        fi
       fi
       continue
     fi
@@ -780,13 +925,32 @@ cmd_sync() {
     if inst="$(installed_version "$n")"; then
       old_kind="${inst%%"$IFS_SEP"*}"
       old_ver="${inst#*"$IFS_SEP"}"
-      if [ "$old_ver" = "$new_ver" ] && [ "$old_kind" = "$new_kind" ] && [ "$missing_md" = "0" ]; then
+      old_repo=""
+      old_path=""
+      if source="$(installed_source "$n")"; then
+        IFS="$IFS_SEP" read -r old_repo old_path <<< "$source"
+        old_path="$(normalize_skill_path "$old_path")"
+      fi
+      source_changed=0
+      if [ "$old_repo" != "$repo" ] || [ "$old_path" != "$path" ]; then source_changed=1; fi
+      if [ "$old_ver" = "$new_ver" ] && [ "$old_kind" = "$new_kind" ] && [ "$missing_md" = "0" ] && [ "$source_changed" = "0" ]; then
         ok "$n 已是最新（$(fmt_ver "$new_kind" "$new_ver")）"
       elif [ "$dry" = "1" ]; then
-        info "[dry-run] $n：$(fmt_ver "$old_kind" "$old_ver") → $(fmt_ver "$new_kind" "$new_ver")"
+        if [ "$source_changed" = "1" ]; then
+          info "[dry-run] $n：技能来源变化（$old_repo/$old_path → $repo/$path），将重新安装"
+        else
+          info "[dry-run] $n：$(fmt_ver "$old_kind" "$old_ver") → $(fmt_ver "$new_kind" "$new_ver")"
+        fi
       else
-        info "$n：$(fmt_ver "$old_kind" "$old_ver") → $(fmt_ver "$new_kind" "$new_ver")"
-        install_one "$n" 1 || true
+        if [ "$source_changed" = "1" ]; then
+          info "$n：技能来源变化（$old_repo/$old_path → $repo/$path），重新安装"
+        else
+          info "$n：$(fmt_ver "$old_kind" "$old_ver") → $(fmt_ver "$new_kind" "$new_ver")"
+        fi
+        if ! install_one "$n" 1; then
+          restore_entry "$n" "$original"
+          failed=1
+        fi
       fi
       continue
     fi
@@ -795,10 +959,13 @@ cmd_sync() {
     TMP_FILE="$(mktemp "${TMPDIR:-/tmp}/skill-md.XXXXXX")"
     if fetch_skill_md "$repo" "$new_ver" "$path" "$TMP_FILE"; then
       if cmp -s "$TMP_FILE" "$target/SKILL.md"; then
-        ok "$n 已存在且内容与最新版一致，纳入管理"
-        if [ "$dry" != "1" ]; then
-          save_state_entry "$n" "$repo" "$path" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"
-          write_marker "$target" "$repo" "$path" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"
+        if [ "$dry" = "1" ]; then
+          info "[dry-run] $n：内容与最新版一致，将纳入管理"
+        elif adopt_skill "$n" "$target" "$repo" "$path" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"; then
+          ok "$n 已存在且内容与最新版一致，纳入管理"
+        else
+          restore_entry "$n" "$original"
+          failed=1
         fi
       elif [ "$force" != "1" ]; then
         warn "$n：已存在但内容与最新版不同，跳过（--force 可备份并更新）"
@@ -806,14 +973,20 @@ cmd_sync() {
         info "[dry-run] $n：已存在但内容不同，将备份并更新"
       else
         info "$n：已存在但内容与最新版不同，备份后更新"
-        install_one "$n" 1 1 || true
+        if ! install_one "$n" 1 1; then
+          restore_entry "$n" "$original"
+          failed=1
+        fi
       fi
     elif [ "$force" = "1" ]; then
       if [ "$dry" = "1" ]; then
         info "[dry-run] $n：无法校验远端内容，将备份并更新"
       else
         warn "$n：无法校验远端内容，按 --force 备份后更新"
-        install_one "$n" 1 1 || true
+        if ! install_one "$n" 1 1; then
+          restore_entry "$n" "$original"
+          failed=1
+        fi
       fi
     else
       warn "$n：已存在但无法获取远端 SKILL.md 校验，跳过（--force 可备份并更新）"
@@ -827,6 +1000,7 @@ cmd_sync() {
     touch_updated_at
     render_md
   fi
+  [ "$failed" = "0" ]
 }
 
 cmd_status() {
@@ -844,11 +1018,13 @@ cmd_status() {
   while IFS="$IFS_SEP" read -r n ver kind; do
     inst="-"
     if iv="$(installed_version "$n")"; then
-      inst="$(printf '%s\n' "$iv" | while IFS="$IFS_SEP" read -r ik v; do fmt_ver "$ik" "$v"; done)"
+      ik="${iv%%"$IFS_SEP"*}"
+      v="${iv#*"$IFS_SEP"}"
+      inst="$(fmt_ver "$ik" "$v")"
     fi
     if [ "$inst" = "-" ]; then
       if [ -e "$SKILLS_DIR/$n" ] || [ -L "$SKILLS_DIR/$n" ]; then st="未托管"; else st="未安装"; fi
-    elif [ "$inst" = "$(fmt_ver "$kind" "$ver")" ]; then
+    elif [ "$ik" = "$kind" ] && [ "$v" = "$ver" ]; then
       st="已最新"
     else
       st="可更新"
@@ -1102,6 +1278,8 @@ cmd_help() {
   不会下载整个仓库；仅当 path 为仓库根目录时才整仓浅克隆。
   check --network 只读取各 skill 的 SKILL.md 校验，不下载仓库。
   sync/update 会联网并把版本写回名单 JSON 和生成的 Markdown；sync --dry-run 不写任何文件。
+  sync/install/update 任一安装失败时最终返回非零；sync/update 恢复失败条目的原 JSON 版本记录。
+  版本不变但 repo/path 变化时也会重新安装。
   非托管同名目录只有内容与远端一致时才直接纳入管理；内容不同或无法校验时，
   必须加 --force 才会备份到 <目标目录>/.backups/<名称>-<时间> 后替换。
 EOF

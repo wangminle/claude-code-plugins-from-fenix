@@ -108,8 +108,7 @@ function Get-ParentDir($path) {
   return $dir
 }
 
-function Save-Json($path, $obj) {
-  $json = ConvertTo-Json -InputObject $obj -Depth 20
+function Save-TextFile($path, $text) {
   $enc = New-Object System.Text.UTF8Encoding($false)
   $full = Resolve-FullPath $path
   $dir = Get-ParentDir $full
@@ -118,13 +117,18 @@ function Save-Json($path, $obj) {
   $tmp = [IO.Path]::Combine($dir, ('.' + $leaf + '.tmp.' + [guid]::NewGuid().ToString('N')))
   $backup = [IO.Path]::Combine($dir, ('.' + $leaf + '.backup.' + [guid]::NewGuid().ToString('N')))
   try {
-    [IO.File]::WriteAllText($tmp, $json + "`n", $enc)
+    [IO.File]::WriteAllText($tmp, $text, $enc)
     if (Test-Path -LiteralPath $full) { [IO.File]::Replace($tmp, $full, $backup) }
     else { [IO.File]::Move($tmp, $full) }
   } finally {
     Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
   }
+}
+
+function Save-Json($path, $obj) {
+  $json = ConvertTo-Json -InputObject $obj -Depth 20
+  Save-TextFile $path ($json + "`n")
 }
 
 function Get-List { Ensure-Data; return (Read-Json $DataFile) }
@@ -184,8 +188,10 @@ function Normalize-SkillPath($path) {
 }
 
 function Get-SkillName($skillMd) {
-  if (-not (Test-Path -LiteralPath $skillMd)) { return $null }
-  $lines = @(Get-Content -LiteralPath $skillMd -TotalCount 40 -Encoding UTF8)
+  # SKILL.md 必须是普通文件：历史安装里同名的目录会让 Get-Content 抛异常。
+  if (-not (Test-Path -LiteralPath $skillMd -PathType Leaf)) { return $null }
+  try { $lines = @(Get-Content -LiteralPath $skillMd -TotalCount 40 -Encoding UTF8) }
+  catch { return $null }
   if ($lines.Count -eq 0 -or $lines[0] -ne '---') { return $null }
   for ($i = 1; $i -lt $lines.Count; $i++) {
     if ($lines[$i] -match '^---\s*$') { break }
@@ -204,7 +210,10 @@ function Get-InstalledVersion($name) {
     if ($state -and $state.skills) {
       $prop = $state.skills.PSObject.Properties[$name]
       if ($prop -and $prop.Value) {
-        return @{ kind = [string]$prop.Value.version_kind; version = [string]$prop.Value.version }
+        return @{
+          kind = [string]$prop.Value.version_kind; version = [string]$prop.Value.version
+          repo = [string]$prop.Value.repo; path = Normalize-SkillPath ([string]$prop.Value.path)
+        }
       }
     }
   }
@@ -212,7 +221,11 @@ function Get-InstalledVersion($name) {
   if (Test-Path -LiteralPath $marker) {
     try {
       $m = Read-Json $marker
-      return @{ kind = [string]$m.version_kind; version = [string]$m.version }
+      if ($m.adoption_pending -eq $true) { return $null }
+      return @{
+        kind = [string]$m.version_kind; version = [string]$m.version
+        repo = [string]$m.repo; path = Normalize-SkillPath ([string]$m.path)
+      }
     } catch { return $null }
   }
   return $null
@@ -235,11 +248,36 @@ function Save-StateEntry($name, $repo, $path, $ver, $kind, $now) {
   Save-Json $StateFile $state
 }
 
-function Write-Marker($target, $repo, $path, $ver, $kind, $now) {
+function Write-Marker($target, $repo, $path, $ver, $kind, $now, [bool]$pending = $false) {
   $m = [pscustomobject]@{
     repo = $repo; path = $path; version = $ver; version_kind = $kind; installed_at = $now
   }
+  if ($pending) { $m | Add-Member -NotePropertyName adoption_pending -NotePropertyValue $true }
   Save-Json ([IO.Path]::Combine($target, '.skill-manager.json')) $m
+}
+
+function Adopt-Skill($name, $target, $repo, $path, $ver, $kind, $now) {
+  $marker = [IO.Path]::Combine($target, '.skill-manager.json')
+  $markerWritten = $false
+  try {
+    $existing = Get-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    if ($existing -and ($existing.PSIsContainer -or
+        ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        (Read-Json $marker).adoption_pending -ne $true)) {
+      throw "标记路径已被占用：$marker"
+    }
+    Write-Marker $target $repo $path $ver $kind $now $true
+    $markerWritten = $true
+    Save-StateEntry $name $repo $path $ver $kind $now
+    return $true
+  } catch {
+    Write-ErrLine "$name：收编失败（$($_.Exception.Message)）"
+    if ($markerWritten) {
+      try { Remove-Item -LiteralPath $marker -Force }
+      catch { Write-ErrLine "$name：无法撤销新建标记，请检查 $marker（$($_.Exception.Message)）" }
+    }
+    return $false
+  }
 }
 
 function Invoke-NativeCapture([string]$file, [string[]]$nativeArgs, [bool]$mergeStderr = $false) {
@@ -282,7 +320,7 @@ function Invoke-GitRetry([string[]]$gitArgs, [int]$attempts = 3, [string]$cleanD
 }
 
 function Parse-Tag($tag) {
-  $m = [regex]::Match($tag, '^([A-Za-z][A-Za-z0-9._-]*-)?v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.]+))?(?:\+[0-9A-Za-z.]+)?$')
+  $m = [regex]::Match($tag, '^([A-Za-z][A-Za-z0-9._-]*-)?v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$')
   if (-not $m.Success) { return $null }
   return [pscustomobject]@{
     Tag = $tag
@@ -361,13 +399,18 @@ function Fetch-Repo($repo, $ver, $kind, $dest, $path) {
   $sparse = $false
   if ($path -and $path -ne '.') { $sparse = $true }
   if ($kind -eq 'tag') {
-    $cloneArgs = @('-c', 'advice.detachedHead=false', 'clone', '--quiet', '--depth', '1')
+    $cloneArgs = @('-c', 'advice.detachedHead=false', 'clone', '--quiet', '--no-checkout', '--depth', '1')
     if ($sparse) { $cloneArgs += @('--filter=blob:none', '--sparse') }
-    $cloneArgs += @('--branch', $ver, "$GitHub/$repo.git", $dest)
+    $cloneArgs += @("$GitHub/$repo.git", $dest)
     if (-not (Invoke-GitRetry $cloneArgs 3 $dest)) { return $false }
+    if (-not (Invoke-GitRetry @('-C', $dest, 'fetch', '--quiet', '--depth', '1', 'origin', "refs/tags/$ver") 3)) { return $false }
     if ($sparse) {
-      if (-not (Invoke-GitRetry @('-C', $dest, 'sparse-checkout', 'set', '--no-cone', "$path/") 2)) { return $false }
+      if (-not (Invoke-GitRetry @('-C', $dest, 'sparse-checkout', 'set', '--no-cone', "/$path/") 2)) { return $false }
     }
+    if (-not (Invoke-GitRetry @('-c', 'advice.detachedHead=false', '-C', $dest, 'checkout', '--quiet', 'FETCH_HEAD') 2)) { return $false }
+    $expected = Invoke-GitCapture @('-C', $dest, 'rev-parse', 'FETCH_HEAD^{commit}')
+    $actual = Invoke-GitCapture @('-C', $dest, 'rev-parse', 'HEAD^{commit}')
+    if (-not $expected -or -not $actual -or ([string]$expected[0]) -ne ([string]$actual[0])) { return $false }
   } else {
     Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
     & git init --quiet $dest | Out-Null
@@ -381,7 +424,7 @@ function Fetch-Repo($repo, $ver, $kind, $dest, $path) {
       $sparseInit = Invoke-NativeCapture 'git' @('-C', $dest, 'sparse-checkout', 'init', '--no-cone')
       if ($sparseInit.Code -ne 0) { return $false }
       $sparseFile = [IO.Path]::Combine([IO.Path]::Combine([IO.Path]::Combine($dest, '.git'), 'info'), 'sparse-checkout')
-      [IO.File]::WriteAllText($sparseFile, "$path/`n", (New-Object System.Text.UTF8Encoding($false)))
+      [IO.File]::WriteAllText($sparseFile, "/$path/`n", (New-Object System.Text.UTF8Encoding($false)))
       $fetchArgs += '--filter=blob:none'
     }
     $fetchArgs += @('origin', $ver)
@@ -389,6 +432,20 @@ function Fetch-Repo($repo, $ver, $kind, $dest, $path) {
     if (-not (Invoke-GitRetry @('-c', 'advice.detachedHead=false', '-C', $dest, 'checkout', '--quiet', 'FETCH_HEAD') 2)) { return $false }
   }
   return $true
+}
+
+function Get-WebClientFile($url, $outFile, $accept) {
+  $wc = New-Object System.Net.WebClient
+  try {
+    $wc.Headers.Add('User-Agent', 'fenix-selected-skills.ps1')
+    if ($accept) { $wc.Headers.Add('Accept', $accept) }
+    $wc.DownloadFile($url, $outFile)
+    return $true
+  } catch {
+    return $false
+  } finally {
+    $wc.Dispose()
+  }
 }
 
 function Get-RemoteSkillMd($repo, $ver, $path, $outFile) {
@@ -400,19 +457,17 @@ function Get-RemoteSkillMd($repo, $ver, $path, $outFile) {
     $curl = Invoke-NativeCapture $script:CurlCmd.Source @('-fsS', '--retry', '2', '--retry-delay', '1', '--connect-timeout', '5', '--max-time', '15', '-o', $outFile, $raw)
     if ($curl.Code -eq 0) { return $true }
   }
-  try {
-    $wc = New-Object System.Net.WebClient
-    $wc.Headers.Add('User-Agent', 'fenix-selected-skills.ps1')
-    $wc.DownloadFile($raw, $outFile)
-    return $true
-  } catch { }
-  try {
-    $wc = New-Object System.Net.WebClient
-    $wc.Headers.Add('User-Agent', 'fenix-selected-skills.ps1')
-    $wc.Headers.Add('Accept', 'application/vnd.github.raw')
-    $wc.DownloadFile($api, $outFile)
-    return $true
-  } catch { }
+  if (Get-WebClientFile $raw $outFile $null) { return $true }
+  if (Get-Command gh -ErrorAction SilentlyContinue) {
+    $result = Invoke-NativeCapture 'gh' @('api', "repos/$repo/contents/$apiPath?ref=$ver", '-H', 'Accept: application/vnd.github.raw')
+    if ($result.Code -eq 0) {
+      $lines = @($result.Output | ForEach-Object { [string]$_ })
+      $enc = New-Object System.Text.UTF8Encoding($false)
+      [IO.File]::WriteAllText($outFile, ($lines -join "`n") + "`n", $enc)
+      if ((Get-Item -LiteralPath $outFile).Length -gt 0) { return $true }
+    }
+  }
+  if (Get-WebClientFile $api $outFile 'application/vnd.github.raw') { return $true }
   return $false
 }
 
@@ -434,12 +489,13 @@ function Install-One($name, [bool]$force = $false, [bool]$backup = $false) {
     Write-Warn "$name：$target 已存在且不是本工具安装，跳过（--force 可覆盖）"
     return $true
   }
-  if (-not (Test-Path -LiteralPath $SkillsDir)) { New-Item -ItemType Directory -Path $SkillsDir -Force | Out-Null }
   $tmp = [IO.Path]::Combine($SkillsDir, ('.install-' + $name + '-' + [guid]::NewGuid().ToString('N')))
-  New-Item -ItemType Directory -Path $tmp -Force | Out-Null
   $oldDest = [IO.Path]::Combine($tmp, 'old')
   $backupDir = $null
+  $preserveOld = $false
   try {
+    if (-not (Test-Path -LiteralPath $SkillsDir)) { New-Item -ItemType Directory -Path $SkillsDir -Force | Out-Null }
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
     Write-Info "$name：下载 $($entry.repo)@$(Format-Ver $entry.version_kind $entry.version)"
     $repoDir = [IO.Path]::Combine($tmp, 'repo')
     if (-not (Fetch-Repo $entry.repo $entry.version $entry.version_kind $repoDir $path)) {
@@ -448,7 +504,7 @@ function Install-One($name, [bool]$force = $false, [bool]$backup = $false) {
     }
     $src = $repoDir
     if ($path -and $path -ne '.') { $src = [IO.Path]::Combine($repoDir, $path.Replace('/', $DirSep)) }
-    if (-not (Test-Path -LiteralPath ([IO.Path]::Combine($src, 'SKILL.md')))) {
+    if (-not (Test-Path -LiteralPath ([IO.Path]::Combine($src, 'SKILL.md')) -PathType Leaf)) {
       Write-ErrLine "$name：下载内容缺少 SKILL.md，请检查 path（当前：$path）"
       return $false
     }
@@ -476,6 +532,7 @@ function Install-One($name, [bool]$force = $false, [bool]$backup = $false) {
         Write-Warn "$name：覆盖非本工具管理的目录 $target"
       }
       try {
+        $preserveOld = $true
         Move-Item -LiteralPath $target -Destination $oldDest
       } catch {
         Write-ErrLine "$name：无法移走原目录，安装已取消（$($_.Exception.Message)）"
@@ -483,19 +540,35 @@ function Install-One($name, [bool]$force = $false, [bool]$backup = $false) {
       }
       if ($backupDir) { Write-Warn "$name：已备份原目录到 $backupDir" }
     }
+    $newInstalled = $false
     try {
       Move-Item -LiteralPath $staged -Destination $target
+      $newInstalled = $true
       Save-StateEntry $name $entry.repo $path $entry.version $entry.version_kind $now
     } catch {
-      Write-ErrLine "$name：替换或状态写入失败，恢复原目录（$($_.Exception.Message)）"
-      if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
-      if (Test-Path -LiteralPath $oldDest) { Move-Item -LiteralPath $oldDest -Destination $target }
+      Write-ErrLine "$name：替换或状态写入失败（$($_.Exception.Message)）"
+      if ($newInstalled) { Remove-Item -LiteralPath $target -Recurse -Force }
+      if ($preserveOld) {
+        if (Test-Path -LiteralPath $target) { throw "目标路径仍存在：$target" }
+        Move-Item -LiteralPath $oldDest -Destination $target
+        $preserveOld = $false
+      }
       return $false
     }
+    $preserveOld = $false
     Write-Ok "$name 已安装到 $target（$(Format-Ver $entry.version_kind $entry.version)）"
     return $true
+  } catch {
+    # 暂存标记、复制等任何异常都返回 false，让 sync/update 能回滚名单版本，
+    # 而不是抛到顶层直接退出、留下「名单已升级但安装没成功」的状态。
+    Write-ErrLine "$name：安装失败（$($_.Exception.Message)）"
+    return $false
   } finally {
-    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    if ($preserveOld -and (Test-Path -LiteralPath $oldDest)) {
+      Write-ErrLine "$name：无法恢复原目录，备份保留在 $oldDest"
+    } else {
+      Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
   }
 }
 
@@ -510,41 +583,53 @@ function Update-EntryVersion($data, $name, $ver, $kind, $now) {
 
 function Sync-One($data, $name, $latest, [bool]$force = $false, [bool]$dry = $false) {
   $entry = Get-Entry $data $name
-  if (-not $entry) { Write-Warn "$name 不在名单中，跳过"; return }
-  if (-not $latest) { Write-Warn "$name：查询 $($entry.repo) 失败，跳过"; return }
+  if (-not $entry) { Write-Warn "$name 不在名单中，跳过"; return $false }
+  if (-not $latest) { Write-Warn "$name：查询 $($entry.repo) 失败，跳过"; return $false }
   $now = Get-Date -Format 'yyyy-MM-dd HH:mm'
+  $entryPath = Normalize-SkillPath ([string]$entry.path)
 
   $target = [IO.Path]::Combine($SkillsDir, $name)
   if (-not (Test-Path -LiteralPath $target -PathType Container)) {
-    if ($dry) { Write-Info "[dry-run] $name：将安装 $(Format-Ver $latest.kind $latest.version)" }
-    else {
-      Write-Info "$name：未安装，安装最新版"
-      Install-One $name $force $force | Out-Null
+    if ((Test-Path -LiteralPath $target) -and -not $force) {
+      Write-Warn "$name：$target 不是目录且未纳入管理，跳过（--force 可备份并替换）"
+      return $true
     }
-    return
+    if ($dry) {
+      if (Test-Path -LiteralPath $target) { Write-Info "[dry-run] $name：同名非目录将备份并替换为 $(Format-Ver $latest.kind $latest.version)" }
+      else { Write-Info "[dry-run] $name：将安装 $(Format-Ver $latest.kind $latest.version)" }
+      return $true
+    }
+    Write-Info "$name：目标缺失或不是目录，安装最新版"
+    return [bool](Install-One $name $force $force)
   }
 
   $skillMd = [IO.Path]::Combine($target, 'SKILL.md')
   $missingMd = $false
-  if (-not (Test-Path -LiteralPath $skillMd)) { Write-Warn "$name：$target 缺少 SKILL.md，按待更新处理"; $missingMd = $true }
+  if (-not (Test-Path -LiteralPath $skillMd -PathType Leaf)) {
+    Write-Warn "$name：$target 缺少有效 SKILL.md，按待更新处理"
+    $missingMd = $true
+  }
   $sname = Get-SkillName $skillMd
   if ($sname -and $sname -ne $name) { Write-Warn "$name：目录名与 SKILL.md 的 name（$sname）不一致" }
 
   $inst = Get-InstalledVersion $name
   if ($inst) {
-    if ($inst.version -eq $latest.version -and $inst.kind -eq $latest.kind -and -not $missingMd) {
+    $sourceChanged = ($inst.repo -ne [string]$entry.repo -or $inst.path -ne $entryPath)
+    if ($inst.version -eq $latest.version -and $inst.kind -eq $latest.kind -and -not $missingMd -and -not $sourceChanged) {
       Write-Ok "$name 已是最新（$(Format-Ver $latest.kind $latest.version)）"
-    } elseif ($dry) {
-      Write-Info "[dry-run] $name：$(Format-Ver $inst.kind $inst.version) → $(Format-Ver $latest.kind $latest.version)"
-    } else {
-      Write-Info "$name：$(Format-Ver $inst.kind $inst.version) → $(Format-Ver $latest.kind $latest.version)"
-      Install-One $name $true $false | Out-Null
+      return $true
     }
-    return
+    if ($dry) {
+      if ($sourceChanged) { Write-Info "[dry-run] $name：技能来源变化（$($inst.repo)/$($inst.path) → $($entry.repo)/$entryPath），将重新安装" }
+      else { Write-Info "[dry-run] $name：$(Format-Ver $inst.kind $inst.version) → $(Format-Ver $latest.kind $latest.version)" }
+      return $true
+    }
+    if ($sourceChanged) { Write-Info "$name：技能来源变化（$($inst.repo)/$($inst.path) → $($entry.repo)/$entryPath），重新安装" }
+    else { Write-Info "$name：$(Format-Ver $inst.kind $inst.version) → $(Format-Ver $latest.kind $latest.version)" }
+    return [bool](Install-One $name $true $false)
   }
 
   $tmpMd = [IO.Path]::Combine([IO.Path]::GetTempPath(), ('skill-md-' + [guid]::NewGuid().ToString('N') + '.md'))
-  $entryPath = Normalize-SkillPath ([string]$entry.path)
   try {
     if (Get-RemoteSkillMd ([string]$entry.repo) $latest.version $entryPath $tmpMd) {
       $same = $false
@@ -552,10 +637,12 @@ function Sync-One($data, $name, $latest, [bool]$force = $false, [bool]$dry = $fa
         $same = ((Get-FileHash -LiteralPath $tmpMd -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $skillMd -Algorithm SHA256).Hash)
       } catch { $same = $false }
       if ($same) {
-        Write-Ok "$name 已存在且内容与最新版一致，纳入管理"
-        if (-not $dry) {
-          Save-StateEntry $name ([string]$entry.repo) $entryPath $latest.version $latest.kind $now
-          Write-Marker $target ([string]$entry.repo) $entryPath $latest.version $latest.kind $now
+        if ($dry) {
+          Write-Info "[dry-run] $name：内容与最新版一致，将纳入管理"
+        } elseif (Adopt-Skill $name $target ([string]$entry.repo) $entryPath $latest.version $latest.kind $now) {
+          Write-Ok "$name 已存在且内容与最新版一致，纳入管理"
+        } else {
+          return $false
         }
       } elseif (-not $force) {
         Write-Warn "$name：已存在但内容与最新版不同，跳过（--force 可备份并更新）"
@@ -563,13 +650,13 @@ function Sync-One($data, $name, $latest, [bool]$force = $false, [bool]$dry = $fa
         Write-Info "[dry-run] $name：已存在但内容不同，将备份并更新"
       } else {
         Write-Info "$name：已存在但内容与最新版不同，备份后更新"
-        Install-One $name $true $true | Out-Null
+        return [bool](Install-One $name $true $true)
       }
     } elseif ($force) {
       if ($dry) { Write-Info "[dry-run] $name：无法校验远端内容，将备份并更新" }
       else {
         Write-Warn "$name：无法校验远端内容，按 --force 备份后更新"
-        Install-One $name $true $true | Out-Null
+        return [bool](Install-One $name $true $true)
       }
     } else {
       Write-Warn "$name：已存在但无法获取远端 SKILL.md 校验，跳过（--force 可备份并更新）"
@@ -577,6 +664,7 @@ function Sync-One($data, $name, $latest, [bool]$force = $false, [bool]$dry = $fa
   } finally {
     Remove-Item -LiteralPath $tmpMd -Force -ErrorAction SilentlyContinue
   }
+  return $true
 }
 
 function Get-ManagedNames {
@@ -633,8 +721,7 @@ function Cmd-List {
 
 function Cmd-Render {
   $lines = Render-Lines
-  $enc = New-Object System.Text.UTF8Encoding($false)
-  [IO.File]::WriteAllText($MdFile, (($lines -join "`n") + "`n"), $enc)
+  Save-TextFile $MdFile (($lines -join "`n") + "`n")
   Write-Ok "已生成 $MdFile"
 }
 
@@ -668,17 +755,26 @@ function Cmd-Install([string[]]$names, [bool]$force = $false) {
 function Cmd-Sync([string[]]$names, [bool]$force = $false, [bool]$dry = $false) {
   $data = Get-List
   if (-not $names -or $names.Count -eq 0) { $names = @($data.skills | ForEach-Object { $_.name }) }
+  # 重复传入同名技能只处理一次：否则第二遍会把已升级的版本当成回滚快照。
+  $names = @($names | Select-Object -Unique)
   Write-Info "目标目录：$SkillsDir"
   $cache = @{}
   $latestByName = @{}
+  $originalByName = @{}
+  $failed = $false
   foreach ($name in $names) {
     $entry = Get-Entry $data $name
-    if (-not $entry) { Write-Warn "$name 不在名单中，跳过"; continue }
+    if (-not $entry) { Write-Warn "$name 不在名单中，跳过"; $failed = $true; continue }
     $repo = [string]$entry.repo
     if (-not $cache.ContainsKey($repo)) { $cache[$repo] = Resolve-Version $repo }
     $latest = $cache[$repo]
-    if (-not $latest) { Write-Warn "$name：查询 $repo 失败，跳过"; continue }
+    if (-not $latest) { Write-Warn "$name：查询 $repo 失败，跳过"; $failed = $true; continue }
     $latestByName[$name] = $latest
+    if (-not $originalByName.ContainsKey($name)) {
+      $originalByName[$name] = [pscustomobject]@{
+        version = [string]$entry.version; kind = [string]$entry.version_kind; checkedAt = [string]$entry.checked_at
+      }
+    }
     if (-not $dry) { Update-EntryVersion $data $name $latest.version $latest.kind (Get-Date -Format 'yyyy-MM-dd HH:mm') }
   }
   if (-not $dry) {
@@ -686,10 +782,26 @@ function Cmd-Sync([string[]]$names, [bool]$force = $false, [bool]$dry = $false) 
     Save-Json $DataFile $data
   }
   foreach ($name in $names) {
-    if ($latestByName.ContainsKey($name)) { Sync-One $data $name $latestByName[$name] $force $dry }
+    if ($latestByName.ContainsKey($name)) {
+      try {
+        $success = Sync-One $data $name $latestByName[$name] $force $dry
+      } catch {
+        Write-ErrLine "$name：同步失败（$($_.Exception.Message)）"
+        $success = $false
+      }
+      if (-not $success) {
+        $failed = $true
+        if (-not $dry) {
+          $original = $originalByName[$name]
+          Update-EntryVersion $data $name $original.version $original.kind $original.checkedAt
+        }
+      }
+    }
   }
+  if (-not $dry -and $failed) { Save-Json $DataFile $data }
   if ($dry) { Write-Info "dry-run 结束，未改动文件" }
   else { Cmd-Render }
+  if ($failed) { Fail '部分技能同步失败' }
 }
 
 function Cmd-Update([string[]]$names) {
@@ -697,35 +809,51 @@ function Cmd-Update([string[]]$names) {
   if (-not $names -or $names.Count -eq 0) { $names = Get-ManagedNames }
   if (-not $names -or $names.Count -eq 0) { Fail "还没有安装记录，先运行 fenix-selected-skills.ps1 sync 或 install" }
   $cache = @{}
+  $failed = $false
   foreach ($name in $names) {
     $entry = Get-Entry $data $name
-    if (-not $entry) { Write-Warn "$name 不在名单中，跳过"; continue }
+    if (-not $entry) { Write-Warn "$name 不在名单中，跳过"; $failed = $true; continue }
+    $original = [pscustomobject]@{
+      version = [string]$entry.version; kind = [string]$entry.version_kind; checkedAt = [string]$entry.checked_at
+    }
     $repo = [string]$entry.repo
+    $entryPath = Normalize-SkillPath ([string]$entry.path)
     if (-not $cache.ContainsKey($repo)) { $cache[$repo] = Resolve-Version $repo }
     $latest = $cache[$repo]
-    if (-not $latest) { Write-Warn "$name：查询 $repo 失败，跳过"; continue }
+    if (-not $latest) { Write-Warn "$name：查询 $repo 失败，跳过"; $failed = $true; continue }
     $target = [IO.Path]::Combine($SkillsDir, $name)
     if (-not (Test-Path -LiteralPath $target -PathType Container) -and (@(Get-ManagedNames) -contains $name)) {
       Update-EntryVersion $data $name $latest.version $latest.kind (Get-Date -Format 'yyyy-MM-dd HH:mm')
       Save-Json $DataFile $data
       Write-Info "$name：技能目录缺失，按最新版重新安装"
-      Install-One $name $true $false | Out-Null
+      if (-not (Install-One $name $true $false)) {
+        $failed = $true
+        Update-EntryVersion $data $name $original.version $original.kind $original.checkedAt
+        Save-Json $DataFile $data
+      }
       continue
     }
     $inst = Get-InstalledVersion $name
     if (-not $inst) { Write-Warn "$name 尚未安装或没有版本记录，跳过（用 sync）"; continue }
+    $sourceChanged = ($inst.repo -ne $repo -or $inst.path -ne $entryPath)
     Update-EntryVersion $data $name $latest.version $latest.kind (Get-Date -Format 'yyyy-MM-dd HH:mm')
     Save-Json $DataFile $data
-    if ($inst.version -eq $latest.version -and $inst.kind -eq $latest.kind) {
+    if ($inst.version -eq $latest.version -and $inst.kind -eq $latest.kind -and -not $sourceChanged) {
       Write-Ok "$name 已是最新（$(Format-Ver $latest.kind $latest.version)）"
     } else {
-      Write-Info "$name：$(Format-Ver $inst.kind $inst.version) → $(Format-Ver $latest.kind $latest.version)"
-      Install-One $name $true $false | Out-Null
+      if ($sourceChanged) { Write-Info "$name：技能来源变化（$($inst.repo)/$($inst.path) → $repo/$entryPath），重新安装" }
+      else { Write-Info "$name：$(Format-Ver $inst.kind $inst.version) → $(Format-Ver $latest.kind $latest.version)" }
+      if (-not (Install-One $name $true $false)) {
+        $failed = $true
+        Update-EntryVersion $data $name $original.version $original.kind $original.checkedAt
+        Save-Json $DataFile $data
+      }
     }
   }
   $data.updated_at = Get-Date -Format 'yyyy-MM-dd'
   Save-Json $DataFile $data
   Cmd-Render
+  if ($failed) { Fail '部分技能更新失败' }
 }
 
 function Cmd-Status {
@@ -741,7 +869,7 @@ function Cmd-Status {
       $target = [IO.Path]::Combine($SkillsDir, [string]$s.name)
       if (Test-Path -LiteralPath $target) { $st = '未托管' } else { $st = '未安装' }
     }
-    elseif ($instText -eq $latestText) { $st = '已最新' }
+    elseif ($inst.kind -eq [string]$s.version_kind -and $inst.version -eq [string]$s.version) { $st = '已最新' }
     else { $st = '可更新' }
     Write-Output ("{0,-30} {1,-12} {2,-12} {3}" -f $s.name, $instText, $latestText, $st)
   }
@@ -913,6 +1041,8 @@ function Cmd-Help {
   安装先下载并校验到临时目录，成功后才替换旧目录，失败保留原版本。
   安装只拉取 skills[].path 对应的子目录（blobless + sparse checkout），不下载整个仓库。
   sync/update 会联网并把版本写回名单 JSON 和生成的 Markdown；sync --dry-run 不写任何文件。
+  sync/install/update 任一安装失败时最终返回非零；sync/update 恢复失败条目的原 JSON 版本记录。
+  版本不变但 repo/path 变化时也会重新安装。
   非托管同名目录内容不同或无法校验时，必须加 --force 才备份到 <目标目录>\.backups\ 后替换。
   在 macOS / Linux 上运行本脚本会自动转交 fenix-selected-skills.sh。
 '@ | Write-Output

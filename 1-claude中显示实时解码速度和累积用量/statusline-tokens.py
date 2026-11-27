@@ -52,14 +52,15 @@
 三、命令行
 ═══════════════════════════════════════════════════════════════════
 
-  python3 statusline-tokens.py --reset   # 把“自重置”起点设为现在
-  python3 statusline-tokens.py --help    # 帮助
-  python3 statusline-tokens.py           # 正常模式：从 stdin 读 Claude Code 的 JSON
+  python3 statusline-tokens.py --reset     # 把“自重置”起点设为现在
+  python3 statusline-tokens.py --no-cache  # 只读试跑，不读写缓存/索引/重置文件
+  python3 statusline-tokens.py --help      # 帮助
+  python3 statusline-tokens.py             # 正常模式：从 stdin 读 Claude Code 的 JSON
 
-  手动试跑（先把 x/y.jsonl 换成真实 transcript 文件名，否则只会显示 0 out）：
+  手动试跑（先把 x/y.jsonl 换成真实 transcript 文件名；--no-cache 避免污染活动会话）：
 
   echo '{"transcript_path":"~/.claude/projects/x/y.jsonl","cost":{"total_api_duration_ms":5000}}' \\
-    | python3 statusline-tokens.py
+    | python3 statusline-tokens.py --no-cache
 
 ═══════════════════════════════════════════════════════════════════
 四、数据文件（都在家目录，脚本不写当前目录）
@@ -91,9 +92,8 @@ N out 回退到 Claude Code 传入的 context_window.total_output_tokens。
 * 「本轮」基线取自最早检测到新 prompt 的那次刷新：api 时长取当时的值，
   输出总量取「该 prompt 在 transcript 里出现时」的累计值，同一块里它
   之后的 assistant 输出属于本轮，不会被吞进基线。
-* cost.total_api_duration_ms 是每个 Claude Code 进程各自累计的。检测到它
-  回退（--resume 或重启）就把本轮基线与「平均」口径都改到本进程，避免用
-  历史全量 output 除以新进程的极小耗时。
+* cost.total_api_duration_ms 在 resume 时可能恢复为全会话累计值，因此「平均」
+  始终直接用 total_out/api_ms；只有「本轮」维护基线，累计值异常回退时才重置。
 * 所有缓存与索引都原子写（每次写独立临时文件再 os.replace），读写一律
   显式 UTF-8，stdin/stdout 也强制 UTF-8（Windows 默认 gbk/cp1252 不会崩）。
 * 外部 JSON（stdin、缓存、索引、transcript 行）一律按「形状不对就丢弃」
@@ -171,7 +171,15 @@ def _atomic_write_json(path, obj, **dump_kwargs):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, **dump_kwargs)
-        os.replace(tmp, path)
+        for attempt in range(20):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                # Windows 上目标文件被另一个状态栏进程短暂打开时可能拒绝替换。
+                if attempt == 19:
+                    raise
+                time.sleep(0.005 * (attempt + 1))
     except BaseException:
         try:
             os.remove(tmp)
@@ -235,10 +243,6 @@ def load_cache(path):
         state["base_out"] = d["base_out"]
     if _is_num(d.get("last_api_ms")) and d["last_api_ms"] >= 0:
         state["last_api_ms"] = d["last_api_ms"]
-    if _is_int(d.get("avg_base_out")) and d["avg_base_out"] >= 0:
-        state["avg_base_out"] = d["avg_base_out"]
-    if _is_num(d.get("avg_base_api_ms")) and d["avg_base_api_ms"] >= 0:
-        state["avg_base_api_ms"] = d["avg_base_api_ms"]
     return state
 
 
@@ -339,9 +343,9 @@ def write_reset_ts(ts):
         RESET_FILE,
         {
             "reset_ts": ts,
-            "reset_at": datetime.datetime.fromtimestamp(ts)
-            .astimezone()
-            .isoformat(),
+            "reset_at": datetime.datetime.fromtimestamp(
+                ts, tz=datetime.timezone.utc
+            ).astimezone().isoformat(),
         },
     )
 
@@ -458,7 +462,7 @@ def totals_from_index(index, today_start, reset_ts):
             if not isinstance(rec, list) or len(rec) < 2:
                 continue
             ts, total = rec[0], rec[1]
-            if not _is_num(ts) or not _is_int(total):
+            if not _is_num(ts) or not _is_int(total) or total < 0:
                 continue
             if ts >= today_start:
                 today += total
@@ -493,13 +497,15 @@ def prune_index(index, cutoff):
                 and len(rec) >= 2
                 and _is_num(rec[0])
                 and rec[0] >= cutoff
+                and _is_int(rec[1])
+                and rec[1] >= 0
             )
         ]
         for mid in stale:
             del msgs[mid]
         dropped += len(stale)
         entry["msgs"] = msgs
-        if not msgs and not os.path.exists(path):
+        if not msgs and not _path_exists(path):
             del index["files"][path]
             dropped += 1
     return dropped
@@ -551,6 +557,63 @@ def sweep_session_caches_once_a_day():
         pass
 
 
+def _canonical_transcript_path(path):
+    absolute = os.path.abspath(path)
+    raw = absolute.encode("utf-8", "surrogateescape")
+    return os.path.normcase(raw.decode("utf-8", "surrogateescape"))
+
+
+def _path_exists(path):
+    if os.name != "nt":
+        path = path.encode("utf-8", "surrogateescape")
+    return os.path.exists(path)
+
+
+def _usage_record_key(rec):
+    if isinstance(rec, list) and len(rec) >= 2:
+        ts = rec[0] if _is_num(rec[0]) else -1
+        total = rec[1] if _is_int(rec[1]) and rec[1] >= 0 else -1
+        return total, ts
+    return -1, -1
+
+
+def merge_usage_index_paths(index):
+    """统一 locale 相关的路径表示，并合并旧索引里的同一文件条目。"""
+    merged_files = {}
+    dirty = False
+    for path, entry in index["files"].items():
+        canonical = _canonical_transcript_path(path)
+        if canonical != path:
+            dirty = True
+        if canonical not in merged_files:
+            merged_files[canonical] = entry
+            continue
+        dirty = True
+        current = merged_files[canonical]
+        if not isinstance(current, dict):
+            current = {"offset": 0, "msgs": {}}
+            merged_files[canonical] = current
+        if not isinstance(entry, dict):
+            continue
+        offset = entry.get("offset", 0)
+        current_offset = current.get("offset", 0)
+        if not _is_int(current_offset) or current_offset < 0:
+            current_offset = 0
+        if _is_int(offset) and offset > current_offset:
+            current["offset"] = offset
+        msgs = current.get("msgs")
+        if not isinstance(msgs, dict):
+            msgs = {}
+            current["msgs"] = msgs
+        incoming = entry.get("msgs")
+        if isinstance(incoming, dict):
+            for mid, rec in incoming.items():
+                if mid not in msgs or _usage_record_key(rec) > _usage_record_key(msgs[mid]):
+                    msgs[mid] = rec
+    index["files"] = merged_files
+    return dirty
+
+
 def usage_totals():
     """返回 (今日总 token, 自上次重置以来总 token)。
 
@@ -558,9 +621,8 @@ def usage_totals():
     ~/.claude/projects 下的全部 transcript，并通过 usage-index 做增量扫描。
     """
     now = datetime.datetime.now().astimezone()
-    today_start = now.replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ).timestamp()
+    midnight = datetime.datetime.combine(now.date(), datetime.time.min)
+    today_start = midnight.astimezone().timestamp()
 
     reset_ts = read_reset_ts()
     if reset_ts is None:
@@ -583,7 +645,7 @@ def usage_totals():
                 return totals_from_index(load_usage_index(), today_start, reset_ts)
 
         index = load_usage_index()
-        dirty = False
+        dirty = merge_usage_index_paths(index)
         pattern = os.path.join(TRANSCRIPT_ROOT, "**", "*.jsonl")
         for path in glob.glob(pattern, recursive=True):
             # 先确认文件还在再建条目：glob 与 getsize 之间文件被删时，
@@ -592,10 +654,11 @@ def usage_totals():
                 size = os.path.getsize(path)
             except OSError:
                 continue
-            entry = index["files"].get(path)
+            key = _canonical_transcript_path(path)
+            entry = index["files"].get(key)
             if not isinstance(entry, dict):
                 entry = {"offset": 0, "msgs": {}}
-                index["files"][path] = entry
+                index["files"][key] = entry
             if size == entry.get("offset"):
                 continue
             new_offset, msgs, changed = scan_usage_file(path, entry)
@@ -626,9 +689,9 @@ def usage_totals():
 def reset_usage():
     ts = time.time()
     write_reset_ts(ts)
-    when = datetime.datetime.fromtimestamp(ts).astimezone().strftime(
-        "%Y-%m-%d %H:%M:%S %Z"
-    )
+    when = datetime.datetime.fromtimestamp(
+        ts, tz=datetime.timezone.utc
+    ).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     print(f"token 统计已重置：{when}")
 
 
@@ -643,15 +706,16 @@ def fmt_tokens(n):
     return str(n)
 
 
-def track_transcript(tp, api_ms):
+def track_transcript(tp, api_ms, use_cache=True):
     """增量读取 transcript，维护单会话缓存，返回统计字典。
 
     返回键：total_out（transcript 累计 output）、turn_out/turn_ms（本轮）、
-    avg_out/avg_ms（本进程或对齐窗口内新增的 output 与耗时，用于算平均）。
+    avg_out/avg_ms（会话累计 output 与 API 耗时，用于算平均）。
     """
-    key = hashlib.sha256(tp.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    key_source = tp if isinstance(tp, bytes) else tp.encode("utf-8", "surrogatepass")
+    key = hashlib.sha256(key_source).hexdigest()[:16]
     cache_path = os.path.join(CACHE_DIR, key + ".json")
-    state = load_cache(cache_path)
+    state = load_cache(cache_path) if use_cache else {"offset": 0, "msgs": {}}
     fresh = "base_api_ms" not in state
     dirty = False
     skip_save = False
@@ -675,42 +739,24 @@ def track_transcript(tp, api_ms):
         total_out = sum(state["msgs"].values())
 
         if fresh:
-            # 首次见到这份 transcript：
-            # - api_ms == 0 且处于首轮流式阶段（没有更早的历史消息）：output 属于
-            #   即将完成的首条 API 请求，不能吞进历史基线；
-            # - api_ms == 0 且已有历史多轮/多条消息：视为 --resume 初启，基线从此刻起算；
-            # - api_ms > 0 且已有历史多消息：api_ms 只属于新进程，历史输出与
-            #   当前耗时同时作为基线，避免拿全历史 token 除以新进程耗时；
-            # - api_ms > 0 且只有当前消息：本轮从此刻起算，平均从 (0, 0) 起算。
+            # 平均直接使用两个会话累计值，无需 avg_base。这里只初始化本轮基线：
+            # 首轮流式且 api_ms=0 时不能吞掉首条回复；恢复历史时从此刻起算本轮。
             if api_ms == 0:
                 is_first_turn_stream = (
                     base_at_prompt == 0
                     or (base_at_prompt is None and len(state["msgs"]) <= 1)
                 )
-                base_out = 0 if is_first_turn_stream else total_out
+                state["base_out"] = 0 if is_first_turn_stream else total_out
                 state["base_api_ms"] = 0
-                state["base_out"] = base_out
-                state["avg_base_api_ms"] = 0
-                state["avg_base_out"] = base_out
-            elif len(state["msgs"]) > 1:
-                # 无缓存恢复一份多消息历史时，api_ms 只属于新进程；把历史输出
-                # 与当前耗时同时作为基线，避免拿全历史 token 除以新进程耗时。
-                state["base_api_ms"] = api_ms
-                state["base_out"] = total_out
-                state["avg_base_api_ms"] = api_ms
-                state["avg_base_out"] = total_out
             else:
                 state["base_api_ms"] = api_ms
                 state["base_out"] = total_out
-                state["avg_base_api_ms"] = 0
-                state["avg_base_out"] = 0
             if new_prompt:
                 state["prompt"] = new_prompt
             dirty = True
         else:
             last_api = state.get("last_api_ms", state["base_api_ms"])
             base_api = state["base_api_ms"]
-            avg_base_api = state.get("avg_base_api_ms", 0)
             if api_ms == 0 and last_api > 0:
                 # 瞬时空 cost 帧或 --resume 首帧：绝不覆写已存基线，也不写盘；
                 # 仅返回实时 total_out，等下一个有效 api_ms 再判定是否续跑或重启。
@@ -723,6 +769,22 @@ def track_transcript(tp, api_ms):
                     "avg_ms": 0,
                 }
             if (
+                last_api == 0
+                and base_api == 0
+                and (
+                    state["base_out"] > 0
+                    or (api_ms > 0 and total_out == prev_out and prev_out > 0)
+                )
+            ):
+                # 已识别的历史，或首次收到正耗时但已有输出未增长：同时对齐
+                # 两条基线，排除该帧之前的累计值。已识别历史的同帧新输出也
+                # 一起进入基线；单轮且同帧有新增时，仍沿用首轮流式口径。
+                state["base_api_ms"] = api_ms
+                state["base_out"] = total_out
+                if new_prompt:
+                    state["prompt"] = new_prompt
+                dirty = True
+            elif (
                 api_ms < last_api
                 and total_out == prev_out
                 and new_prompt is None
@@ -731,30 +793,19 @@ def track_transcript(tp, api_ms):
                 # 并发乱序的旧刷新帧（无新输出、api_ms 仅小幅落后于已落盘新帧）：
                 # 不触发 reset，也不覆写缓存。
                 skip_save = True
-            elif (
-                api_ms < last_api
-                or api_ms < base_api
-                or api_ms < avg_base_api
-            ):
-                # total_api_duration_ms 是每个 Claude Code 进程各自累计的，
-                # 回退（或异常缓存里 api_ms < 基线）说明会话被 --resume/重启过，
-                # 基线和平均口径都改到「本进程」，分子与分母成对重置。
+            elif api_ms < last_api or api_ms < base_api:
+                # 会话累计值正常只增不减；异常回退时只重置本轮基线。
+                # --resume 恢复的累计值不构成回退，平均始终用 total_out/api_ms。
                 if base_at_prompt is not None and base_at_prompt == prev_out:
                     state["base_api_ms"] = 0
                     state["base_out"] = prev_out
-                    state["avg_base_api_ms"] = 0
-                    state["avg_base_out"] = prev_out
                 elif base_at_prompt is None:
                     state["base_api_ms"] = 0
                     state["base_out"] = prev_out
-                    state["avg_base_api_ms"] = 0
-                    state["avg_base_out"] = prev_out
                 else:
                     # 本块在新提问前还混有旧轮次输出：分子与分母同时对齐到「此刻」。
                     state["base_api_ms"] = api_ms
                     state["base_out"] = total_out
-                    state["avg_base_api_ms"] = api_ms
-                    state["avg_base_out"] = total_out
                 if new_prompt:
                     state["prompt"] = new_prompt
                 dirty = True
@@ -783,7 +834,7 @@ def track_transcript(tp, api_ms):
             if state.get("last_api_ms") != api_ms:
                 state["last_api_ms"] = api_ms
                 dirty = True
-            if dirty:
+            if dirty and use_cache:
                 try:
                     save_cache(cache_path, state)
                 except OSError:
@@ -798,12 +849,12 @@ def track_transcript(tp, api_ms):
         "total_out": total_out,
         "turn_out": total_out - state["base_out"],
         "turn_ms": api_ms - state["base_api_ms"],
-        "avg_out": max(total_out - state.get("avg_base_out", 0), 0),
-        "avg_ms": api_ms - state.get("avg_base_api_ms", 0),
+        "avg_out": total_out,
+        "avg_ms": api_ms,
     }
 
 
-def main():
+def main(no_cache=False):
     _force_utf8_stdio()
     data = _read_stdin_json()
     if not isinstance(data, dict):
@@ -821,11 +872,18 @@ def main():
     stats = {}
     if isinstance(tp, str) and tp:
         tp = os.path.expanduser(tp)
-        try:
-            if os.path.isfile(tp):
-                stats = track_transcript(tp, api_ms)
-        except Exception:
-            stats = {}
+        candidates = [tp]
+        if os.name != "nt":
+            # C locale 下 Python 3 的文件系统编码可能是 ASCII；同一路径的
+            # UTF-8 bytes 形式仍可正常 open/stat，且与字符串形式共用缓存键。
+            candidates.append(tp.encode("utf-8", "surrogatepass"))
+        for candidate in candidates:
+            try:
+                if os.path.isfile(candidate):
+                    stats = track_transcript(candidate, api_ms, use_cache=not no_cache)
+                    break
+            except Exception:
+                stats = {}
 
     total_out = stats.get("total_out")
     turn_out = stats.get("turn_out")
@@ -840,11 +898,12 @@ def main():
         avg_ms = api_ms
 
     today_tokens = reset_tokens = None
-    try:
-        today_tokens, reset_tokens = usage_totals()
-    except Exception:
-        # 统计失败不能影响状态栏本身
-        pass
+    if not no_cache:
+        try:
+            today_tokens, reset_tokens = usage_totals()
+        except Exception:
+            # 统计失败不能影响状态栏本身
+            pass
 
     parts = []
     turn_speed = None
@@ -876,14 +935,18 @@ def main():
 
 if __name__ == "__main__":
     _force_utf8_stdio()
+    usage = "用法: statusline-tokens.py [--reset | --no-cache]"
     if len(sys.argv) == 1:
         main()
+    elif len(sys.argv) == 2 and sys.argv[1] == "--no-cache":
+        main(no_cache=True)
     elif len(sys.argv) == 2 and sys.argv[1] == "--reset":
         reset_usage()
     elif len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
-        print("用法: statusline-tokens.py [--reset]")
-        print("  --reset  将“自重置”token 计数起点设为当前时间")
+        print(usage)
+        print("  --reset    将“自重置”token 计数起点设为当前时间")
+        print("  --no-cache 只读试跑，不读写缓存、索引或重置文件")
     else:
-        print("用法: statusline-tokens.py [--reset]", file=sys.stderr)
+        print(usage, file=sys.stderr)
         print(f"未知参数：{' '.join(sys.argv[1:])}", file=sys.stderr)
         sys.exit(2)

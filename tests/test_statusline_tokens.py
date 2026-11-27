@@ -21,6 +21,8 @@ SCRIPT = os.path.join(
     ROOT, "1-claude中显示实时解码速度和累积用量", "statusline-tokens.py"
 )
 HOOK = os.path.join(ROOT, ".claude", "hooks", "tasklist_sync_reminder.sh")
+BASH = shutil.which("bash") if os.name != "nt" else None
+HOOK_AVAILABLE = bool(BASH and os.path.isfile(HOOK))
 
 
 def load_module():
@@ -73,12 +75,12 @@ class Base(unittest.TestCase):
             for line in lines:
                 f.write(line + "\n")
 
-    def run_main(self, payload, raw=None):
+    def run_main(self, payload, raw=None, no_cache=False):
         text = raw if raw is not None else json.dumps(payload)
         out = io.StringIO()
         with mock.patch.object(sys, "stdin", io.StringIO(text)):
             with contextlib.redirect_stdout(out):
-                self.m.main()
+                self.m.main(no_cache=no_cache)
         return out.getvalue()
 
     def render(self, api_ms, **extra):
@@ -123,12 +125,12 @@ class TestBug004ApiDurationReset(Base):
     def test_average_not_inflated_after_resume(self):
         self.append(assistant_line("a", 100000))
         self.render(50000)
-        out = self.render(500)  # 新进程：api 时长从 0 重新累计
-        self.assertNotIn("平均", out)
+        out = self.render(500)
+        self.assertIn("平均 200000.0 tok/s", out)
         self.assertIn("100.0k out", out)
         self.append(assistant_line("b", 100))
         out = self.render(2000)
-        self.assertIn("平均 50.0 tok/s", out)
+        self.assertIn("平均 50050.0 tok/s", out)
         self.assertNotIn("本轮 -", out)
 
     def test_old_cache_without_last_api_ms_detects_reset(self):
@@ -147,8 +149,7 @@ class TestBug004ApiDurationReset(Base):
                 f,
             )
         out = self.render(500)
-        self.assertNotIn("109654.0", out)
-        self.assertNotIn("平均", out)
+        self.assertIn("平均 219308.0 tok/s", out)
 
 
 class TestBug005Tilde(Base):
@@ -355,12 +356,12 @@ class TestBug009Edges(Base):
         self.assertFalse(os.path.exists(self.m.USAGE_INDEX))
 
 
-@unittest.skipUnless(shutil.which("bash"), "需要 bash")
+@unittest.skipUnless(HOOK_AVAILABLE, "需要本机 Unix bash 与仓库内可用的 Stop hook")
 class TestHook(unittest.TestCase):
     def run_hook(self, session_id, tmpdir):
         env = dict(os.environ, TMPDIR=tmpdir)
         return subprocess.run(
-            ["bash", HOOK],
+            [BASH, HOOK],
             input=json.dumps({"session_id": session_id}).encode(),
             capture_output=True,
             env=env,
@@ -379,12 +380,15 @@ class TestHook(unittest.TestCase):
         self.assertNotIn("/", names[0])
         self.assertFalse(os.path.exists(os.path.join(tmpdir, "..", "evil")))
         second = self.run_hook("../../evil/x", tmpdir)
+        self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(second.stdout, b"")
 
     def test_output_is_ascii_json(self):
         tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
         proc = self.run_hook("abc", tmpdir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout)
         proc.stdout.decode("ascii")  # ensure_ascii：任何管道编码都安全
 
 
@@ -426,11 +430,10 @@ class TestBug011ResumeAvgWithoutPrompt(Base):
         # 恢复后无新提问，直接产出回复
         self.append(assistant_line("b", 1000))
         out = self.render(10_000)
-        self.assertIn("平均 100.0 tok/s", out)
+        self.assertIn("平均 10100.0 tok/s", out)
         self.append(assistant_line("c", 200))
         out = self.render(12_000)
-        self.assertIn("平均 100.0 tok/s", out)
-        self.assertNotIn("平均 16.7 tok/s", out)
+        self.assertIn("平均 8433.3 tok/s", out)
 
     def test_api_ms_below_base_api_ms_resets_baseline(self):
         self.append(assistant_line("a", 100))
@@ -553,7 +556,7 @@ class TestBug013AverageSpeedResilience(Base):
         self.assertIn("8.0k out", out)
         self.append(user_line("p3"), assistant_line("m3", 100))
         out = self.render(2_000)
-        self.assertIn("平均 50.0 tok/s", out)
+        self.assertIn("平均 4050.0 tok/s", out)
 
     def test_transient_empty_cost_frame_does_not_corrupt_baselines(self):
         self.append(assistant_line("m1", 5000))
@@ -578,7 +581,7 @@ class TestBug013AverageSpeedResilience(Base):
         self.assertIn("本轮 50.0 tok/s", out)
         self.assertIn("平均 50.0 tok/s", out)
 
-    def test_resume_mixed_chunk_pairs_avg_base_api_ms(self):
+    def test_resume_mixed_chunk_uses_session_average(self):
         self.append(user_line("p1"), assistant_line("m1", 5000))
         self.render(60_000)
         # 恢复时同一块里既含旧轮尾部输出，又含新提问与回复 -> 触发 else 对齐此刻
@@ -588,12 +591,10 @@ class TestBug013AverageSpeedResilience(Base):
             assistant_line("m2", 500),
         )
         out = self.render(20_000)
-        self.assertNotIn("平均", out)
-        # 后续新增 500 tok / 10s：分母应扣掉 20s，算得 50.0 tok/s 而非 16.7 tok/s
+        self.assertIn("平均 300.0 tok/s", out)
         self.append(assistant_line("m3", 500))
         out = self.render(30_000)
-        self.assertIn("平均 50.0 tok/s", out)
-        self.assertNotIn("平均 16.7 tok/s", out)
+        self.assertIn("平均 216.7 tok/s", out)
 
 
 class TestBug014TurnAndCliEdges(Base):
@@ -615,13 +616,13 @@ class TestBug014TurnAndCliEdges(Base):
             assistant_line("b", 3000),
         )
         out = self.render(2_000)
-        self.assertNotIn("平均", out)
+        self.assertIn("平均 4000.0 tok/s", out)
         state = self.cache_state()
-        self.assertEqual(state["avg_base_out"], 8000)
-        self.assertEqual(state["avg_base_api_ms"], 2000)
+        self.assertNotIn("avg_base_out", state)
+        self.assertNotIn("avg_base_api_ms", state)
         self.append(assistant_line("c", 100))
         out = self.render(4_000)
-        self.assertIn("平均 50.0 tok/s", out)
+        self.assertIn("平均 2025.0 tok/s", out)
 
     def test_unknown_arguments_exit_without_reading_stdin(self):
         proc = subprocess.run(
@@ -655,6 +656,179 @@ class TestBug014TurnAndCliEdges(Base):
             self.transcript, {"offset": 0, "msgs": {}}
         )
         self.assertEqual(msgs["negative"][1], 10)
+
+
+class TestBug040SingleTurnResume(Base):
+    def test_restored_duration_without_new_output_reanchors_both_baselines(self):
+        self.append(user_line("p1"), assistant_line("history", 500_000))
+        self.assertNotIn("本轮", self.render(0))
+
+        out = self.render(20_000_000)
+        self.assertNotIn("本轮", out)
+        self.assertIn("平均 25.0 tok/s", out)
+
+        self.append(assistant_line("new", 500))
+        out = self.render(20_005_400)
+        self.assertIn("本轮 92.6 tok/s", out)
+        self.assertIn("平均 25.0 tok/s", out)
+
+    def test_first_timed_frame_with_one_new_message_keeps_streaming_baseline(self):
+        self.append(user_line("p1"), assistant_line("first", 200))
+        self.render(0)
+        self.render(0)  # 未收到有效耗时，暂不判定为历史
+
+        self.append(assistant_line("second", 50))
+        out = self.render(5_000)
+        self.assertIn("本轮 50.0 tok/s", out)
+        self.assertIn("平均 50.0 tok/s", out)
+
+
+class TestOpenIssuesSessionAndWindows(Base):
+    def test_resume_restored_session_duration_uses_session_average(self):
+        self.append(
+            user_line("p1"),
+            assistant_line("h1", 3_000_000),
+            user_line("p2"),
+            assistant_line("h2", 811_275),
+        )
+        self.render(0)
+        out = self.render(41_229_587)
+        self.assertIn("平均 92.4 tok/s", out)
+        self.append(assistant_line("new", 500))
+        out = self.render(41_234_987)
+        self.assertIn("平均 92.4 tok/s", out)
+        self.assertIn("本轮 92.6 tok/s", out)
+        self.assertNotIn("平均 0.", out)
+
+    def test_restored_duration_and_first_output_in_same_frame(self):
+        # BUG-029：恢复的累计耗时与首批 500 tokens 同帧到达时，这批输出必须
+        # 一起进入基线；否则下一帧会把两批 500 一起除以 5.4 秒，显示 185.2。
+        self.append(
+            user_line("p1"),
+            assistant_line("h1", 3_000_000),
+            user_line("p2"),
+            assistant_line("h2", 811_275),
+        )
+        self.render(0)
+        self.append(assistant_line("new1", 500))
+        self.render(41_229_587)
+        self.append(assistant_line("new2", 500))
+        out = self.render(41_234_987)
+        self.assertIn("本轮 92.6 tok/s", out)
+        self.assertIn("平均 92.5 tok/s", out)
+        self.assertNotIn("185", out)
+
+    def test_no_cache_never_reads_or_writes_state_files(self):
+        self.append(assistant_line("a", 10))
+        with mock.patch.object(self.m, "load_cache", side_effect=AssertionError("read cache")), \
+             mock.patch.object(self.m, "save_cache", side_effect=AssertionError("write cache")), \
+             mock.patch.object(self.m, "usage_totals", side_effect=AssertionError("usage index")):
+            out = self.run_main(
+                {"transcript_path": self.transcript, "cost": {"total_api_duration_ms": 1000}},
+                no_cache=True,
+            )
+        self.assertIn("平均 10.0 tok/s", out)
+        self.assertIn("10 out", out)
+        self.assertNotIn("今日", out)
+        self.assertFalse(os.path.exists(self.m.CACHE_DIR))
+
+    def test_atomic_replace_retries_transient_permission_errors(self):
+        path = os.path.join(self.m.CACHE_DIR, "retry.json")
+        real_replace = os.replace
+        calls = [0]
+
+        def flaky_replace(src, dst):
+            calls[0] += 1
+            if calls[0] <= 2:
+                raise PermissionError(13, "locked")
+            return real_replace(src, dst)
+
+        with mock.patch.object(self.m.os, "replace", side_effect=flaky_replace), \
+             mock.patch.object(self.m.time, "sleep") as sleep:
+            self.m.save_cache(path, {"offset": 1, "msgs": {}})
+        self.assertEqual(sleep.call_count, 2)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["offset"], 1)
+
+    def test_negative_index_records_are_ignored_and_pruned(self):
+        index = {
+            "v": 1,
+            "files": {
+                "/x": {"msgs": {"good": [100, 5], "bad": [100, -50]}},
+            },
+        }
+        self.assertEqual(self.m.totals_from_index(index, 0, 0), (5, 5))
+        self.m.prune_index(index, 0)
+        self.assertEqual(index["files"]["/x"]["msgs"], {"good": [100, 5]})
+    def test_locale_switches_reuse_one_usage_index_entry(self):
+        home = os.path.join(self.tmp, "locale-home")
+        project = os.path.join(home, ".claude", "projects", "中文项目")
+        os.makedirs(project)
+        transcript = os.path.join(project, "会话.jsonl")
+        now_iso = self.m.datetime.datetime.now().astimezone().isoformat()
+        with open(transcript, "w", encoding="utf-8") as f:
+            f.write(assistant_line("localized", 1200, now_iso) + "\n")
+        os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+        with open(os.path.join(home, ".claude", "statusline-usage-reset.json"), "w", encoding="utf-8") as f:
+            json.dump({"reset_ts": 1.0}, f)
+        cache = os.path.join(self.tmp, "locale-cache")
+        payload = json.dumps(
+            {"transcript_path": transcript, "cost": {"total_api_duration_ms": 1000}},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        for locale in ("C", "C.UTF-8", "C"):
+            env = dict(os.environ)
+            env.update(
+                HOME=home, USERPROFILE=home, XDG_CACHE_HOME=cache,
+                LC_ALL=locale, LANG=locale, PYTHONUTF8="0",
+                PYTHONCOERCECLOCALE="0", PYTHONIOENCODING="cp1252",
+            )
+            proc = subprocess.run(
+                [sys.executable, SCRIPT], input=payload, capture_output=True, env=env, timeout=10
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = proc.stdout.decode("utf-8")
+            self.assertIn("今日 1.2k tok", out)
+            self.assertIn("自重置 1.2k tok", out)
+            with open(os.path.join(cache, "claude-statusline", "usage-index.json"), encoding="utf-8") as f:
+                self.assertEqual(len(json.load(f)["files"]), 1)
+
+    def test_dst_fall_back_midnight_uses_midnights_offset(self):
+        if not hasattr(self.m.time, "tzset"):
+            self.skipTest("需要可设置本地时区的平台")
+        old_tz = os.environ.get("TZ")
+
+        def restore_tz():
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            self.m.time.tzset()
+
+        os.environ["TZ"] = "America/New_York"
+        self.m.time.tzset()
+        self.addCleanup(restore_tz)
+        real_datetime = self.m.datetime.datetime
+
+        class FrozenDateTime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 11, 1, 3, 0)
+                return value if tz is None else value.astimezone(tz)
+
+        project = os.path.join(self.m.TRANSCRIPT_ROOT, "dst")
+        os.makedirs(project)
+        path = os.path.join(project, "t.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "assistant", "timestamp": "2026-11-01T00:30:00-04:00",
+                "message": {"id": "dst", "usage": {"input_tokens": 0, "output_tokens": 1200}},
+            }) + "\n")
+        self.m.write_reset_ts(1.0)
+        with mock.patch.object(self.m.datetime, "datetime", FrozenDateTime):
+            today, since_reset = self.m.usage_totals()
+        self.assertEqual(today, 1200)
+        self.assertEqual(since_reset, 1200)
 
 
 if __name__ == "__main__":

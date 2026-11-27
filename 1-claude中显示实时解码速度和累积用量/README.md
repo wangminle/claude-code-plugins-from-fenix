@@ -37,7 +37,7 @@ Windows `cmd.exe` 使用双引号和 `python`；JSON 中的反斜杠必须双写
 ## 指标口径
 
 - **本轮**：本次真实提问后新增的 output tokens 除以本轮 API 耗时；不足 0.8 秒不显示。只认 `promptSource` 为 `typed`、`sdk`、`queued` 的提问，系统通知和工具结果不另起一轮。
-- **平均**：本会话累计 output tokens 除以累计 API 耗时，包含工具往返等空转；恢复会话时按当前 Claude Code 进程重新建立基线，避免历史输出除以新进程耗时。
+- **平均**：本会话累计 output tokens 除以累计 API 耗时，包含工具往返等空转。新版 Claude Code 在 `--resume` 时会恢复全会话累计 `total_api_duration_ms`，因此不再对平均值应用进程基线，避免恢复后平均速度被压低。
 - **N out**：当前 transcript 中按 `message.id` 去重后的 output tokens。transcript 不可读时，回退到 `context_window.total_output_tokens`。
 - **今日 / 自重置**：递归读取 `~/.claude/projects` 下所有会话及 `subagents/*.jsonl`，统计 input、output 和缓存读写 token。「自重置」从最近一次 `--reset` 开始，未重置时从首次运行开始。
 - **ctx / 模型名**：直接使用 Claude Code 传入的上下文占用和模型显示名。
@@ -45,16 +45,17 @@ Windows `cmd.exe` 使用双引号和 `python`；JSON 中的反斜杠必须双写
 ## 命令行
 
 ```bash
-python3 statusline-tokens.py           # 从 stdin 读取 Claude Code JSON
-python3 statusline-tokens.py --reset   # 把“自重置”起点设为现在
+python3 statusline-tokens.py            # 从 stdin 读取 Claude Code JSON
+python3 statusline-tokens.py --no-cache # 只读试跑：不读写单会话缓存、索引或重置文件
+python3 statusline-tokens.py --reset    # 把“自重置”起点设为现在
 python3 statusline-tokens.py --help
 ```
 
-未知参数会输出用法并以状态码 2 退出，不会进入 stdin 等待。手动试跑时，先把示例中的 `x/y.jsonl` 换成真实 transcript 文件名：
+未知参数会输出用法并以状态码 2 退出，不会进入 stdin 等待。手动试跑时，把示例中的 `x/y.jsonl` 换成真实 transcript 文件名，并**务必加上 `--no-cache`**（或用 `XDG_CACHE_HOME=$(mktemp -d)` 隔离缓存），以免伪造的 `total_api_duration_ms` 污染正在运行会话的缓存基线：
 
 ```bash
 echo '{"transcript_path":"~/.claude/projects/x/y.jsonl","cost":{"total_api_duration_ms":5000}}' \
-  | python3 statusline-tokens.py
+  | python3 statusline-tokens.py --no-cache
 ```
 
 ## 数据与缓存

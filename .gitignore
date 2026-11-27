@@ -52,6 +52,10 @@ task-list-archive-*.md
 # ── 自选 skills 名单脚本的产物（--target 指向仓库内时才会出现）──
 # JSON / md 原子写留下的中间文件，进程被中断时可能残留
 fenix-selected-skills.*.tmp.*
+.fenix-selected-skills.*.tmp.*
+.fenix-selected-skills.*.backup.*
+# Syncthing 在同步期间生成的临时文件
+~syncthing~*.tmp
 # 安装状态、托管标记与替换前的备份；默认落在 ~/.claude/skills 下
 .skills-manager.json
 .skill-manager.json

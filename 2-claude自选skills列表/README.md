@@ -79,8 +79,8 @@ Each target keeps its own state file, so a user-level and a project-level instal
 ## How installation works
 
 1. The skill's `path` in its repository is sparse-checked-out with `git clone --depth 1 --filter=blob:none --sparse`, so only that sub-directory is transferred. Root-level skills (`path` empty or `.`) fall back to a shallow clone of the whole repository, and the script says so.
-2. Downloading and validation happen in a staging directory on the target filesystem. The old directory is moved aside only after the staged copy contains `SKILL.md`; replacement or state-write failure restores the old version.
-3. Directories created by this tool are recognised by the state file and a `.skill-manager.json` marker inside each skill directory; they are replaced in place on update.
+2. Downloading and validation happen in a staging directory on the target filesystem. The old directory is moved aside only after the staged copy contains `SKILL.md`. If replacement or state writing fails, the tool tries to restore the old directory. If restoration also fails, it keeps the backup and prints its path for manual recovery.
+3. Directories installed by this tool are recognised by the state file or a local `.skill-manager.json` marker. For an existing directory adopted by `sync`, the central state entry is required: a leftover adoption marker alone cannot authorize replacement.
 4. A same-named directory that this tool did not create is left untouched unless `--force` is passed. `sync` backs it up to `<target>/.backups/<name>-<timestamp>` before replacing it; it is adopted without a copy when its `SKILL.md` is byte-identical to the remote one. `install --force` replaces it without a backup, so prefer `sync --force` when you want one.
 
 ## State files
@@ -136,7 +136,7 @@ Names must be lowercase letters, digits and hyphens. `repo` must be `owner/name`
 - The list contains 46 entries across eight categories; the Markdown table is sorted by a fixed category order, then by name.
 - The Bash implementation requires `jq` for every command except `help` and `env`; the PowerShell implementation uses built-in JSON cmdlets and does not require `jq`.
 - `check --network` reads only `SKILL.md` files, with a fallback from `raw.githubusercontent.com` to the GitHub API, so a blocked raw host does not fail the run.
-- Git operations retry on transient network errors. A failing entry during a batch run is reported without preventing later entries; `install` returns a non-zero status if any installation fails.
+- Git operations retry on transient network errors. A failing entry during a batch run is reported without preventing later entries; `install`, `sync`, and `update` return non-zero if an installation fails, and the latter two restore the failed entry's original JSON version record. A changed repo or normalized path triggers reinstall even when the version is unchanged.
 - Git always runs non-interactively (`GIT_TERMINAL_PROMPT=0`): a private or missing repository fails fast instead of waiting at a username/password prompt.
 - Repository paths are normalized (`./skills/x/`, `skills//x`, `skills/x/.` all become `skills/x`); absolute paths and `..` are rejected, and a malformed `skills` array (non-object entries) fails every command with a clear error.
 
@@ -235,8 +235,8 @@ Windows 下：
 ## 安装行为
 
 1. 用 `git clone --depth 1 --filter=blob:none --sparse` 只取仓库中 `path` 指向的子目录；只有 `path` 为空或 `.`（技能在仓库根目录）时才退回整仓浅克隆，并会给出提示。
-2. 先在目标文件系统的暂存目录中下载并校验；暂存内容包含 `SKILL.md` 后才移开旧目录。替换或状态写入失败会恢复原版本。
-3. 本工具创建的目录通过状态文件与技能目录内的 `.skill-manager.json` 标记识别，更新时就地替换。
+2. 先在目标文件系统的暂存目录中下载并校验；暂存内容包含 `SKILL.md` 后才移开旧目录。替换或状态写入失败时尝试恢复旧目录；如果恢复也失败，会保留备份并打印路径，供手动恢复。
+3. 本工具安装的目录可通过状态文件或目录内的 `.skill-manager.json` 标记识别。对 `sync` 收编的既有目录，以中心状态条目为准；只有收编标记而没有中心状态，不会授权替换本地目录。
 4. 非本工具创建的同名目录默认不动，加 `--force` 才处理：`sync` 会先备份到 `<目标目录>/.backups/<名称>-<时间>` 再替换；若其 `SKILL.md` 与远端逐字节一致，则直接纳入管理、不产生备份。`install --force` 不做备份直接替换，需要备份请用 `sync --force`。
 
 ## 状态文件
@@ -292,7 +292,7 @@ Windows 下：
 - 目前共 46 项、8 个分类；Markdown 表格按固定的分类顺序排序，同类别内按名称排序。
 - Bash 版除 `help` 与 `env` 外都依赖 `jq`；PowerShell 版使用内置 JSON 命令，不依赖 `jq`。
 - `check --network` 只读取各技能的 `SKILL.md`，在 `raw.githubusercontent.com` 不可达时会回退到 GitHub API，因此 raw 域名被阻断不会导致检查失败。
-- git 操作对偶发网络错误会重试；批量执行时单项失败会告警并继续处理后续条目，`install` 在任一安装失败时返回非零状态。
+- git 操作对偶发网络错误会重试；批量执行时单项失败会告警并继续处理后续条目。`install`、`sync`、`update` 在任一安装失败时返回非零，后两者还会恢复失败条目的原 JSON 版本记录。即使版本不变，仓库或规范化路径变化也会触发重装。
 - git 始终非交互执行（`GIT_TERMINAL_PROMPT=0`）：仓库私有或不存在时立即报错，不会卡在账号密码提示。
 - 仓库路径会自动归一化（`./skills/x/`、`skills//x`、`skills/x/.` 都按 `skills/x` 处理）；绝对路径与 `..` 会被拒绝，`skills` 数组里出现非对象条目时所有命令都会明确报错。
 
