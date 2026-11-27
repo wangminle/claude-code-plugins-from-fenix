@@ -770,7 +770,7 @@ cmd_install() {
 
 cmd_update() {
   local names=() n repo path latest new_kind new_ver old_ver old_kind inst source old_repo old_path original fields
-  local failed=0 source_changed=0
+  local failed=0 succeeded=0 source_changed=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --target) [ $# -ge 2 ] || die "--target 需要参数"; apply_target_arg "$2"; shift 2 ;;
@@ -810,6 +810,8 @@ cmd_update() {
       if ! install_one "$n" 1; then
         restore_entry "$n" "$original"
         failed=1
+      else
+        succeeded=1
       fi
       continue
     fi
@@ -830,6 +832,7 @@ cmd_update() {
     update_entry_version "$n" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"
     if [ "$new_ver" = "$old_ver" ] && [ "$new_kind" = "$old_kind" ] && [ "$source_changed" = "0" ]; then
       ok "$n 已是最新（$(fmt_ver "$new_kind" "$new_ver")）"
+      succeeded=1
     else
       if [ "$source_changed" = "1" ]; then
         info "$n：技能来源变化（$old_repo/$old_path → $repo/$path）"
@@ -839,18 +842,22 @@ cmd_update() {
       if ! install_one "$n" 1; then
         restore_entry "$n" "$original"
         failed=1
+      else
+        succeeded=1
       fi
     fi
   done
-  touch_updated_at
-  render_md
+  if [ "$succeeded" = "1" ]; then
+    touch_updated_at
+    render_md
+  fi
   [ "$failed" = "0" ]
 }
 
 cmd_sync() {
-  local force=0 dry=0 failed=0 n repo path ver kind latest new_kind new_ver target sname inst old_kind old_ver fields missing_md original
-  local source old_repo old_path source_changed=0
-  local names=()
+  local force=0 dry=0 failed=0 succeeded=0 n repo path ver kind latest new_kind new_ver target sname inst old_kind old_ver fields missing_md original
+  local source old_repo old_path source_changed=0 seen_names="|"
+  local names=() unique_names=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --force|-f) force=1; shift ;;
@@ -863,6 +870,16 @@ cmd_sync() {
   done
   if [ ${#names[@]} -eq 0 ]; then
     while IFS= read -r n; do names+=("$n"); done < <(jq -r '.skills[].name' "$DATA_FILE")
+  fi
+  if [ ${#names[@]} -gt 0 ]; then
+    for n in "${names[@]}"; do
+      case "$seen_names" in
+        *"|$n|"*) continue ;;
+      esac
+      seen_names="${seen_names}${n}|"
+      unique_names+=("$n")
+    done
+    names=("${unique_names[@]}")
   fi
   start_cache
   info "目标目录：$SKILLS_DIR"
@@ -895,6 +912,7 @@ cmd_sync() {
     if [ ! -d "$target" ]; then
       if { [ -e "$target" ] || [ -L "$target" ]; } && [ "$force" != "1" ]; then
         warn "$n：$target 不是目录且未纳入管理，跳过（--force 可备份并替换）"
+        if [ "$dry" != "1" ]; then succeeded=1; fi
         continue
       fi
       if [ "$dry" = "1" ]; then
@@ -908,6 +926,8 @@ cmd_sync() {
         if ! install_one "$n" "$force" "$force"; then
           restore_entry "$n" "$original"
           failed=1
+        else
+          succeeded=1
         fi
       fi
       continue
@@ -935,6 +955,7 @@ cmd_sync() {
       if [ "$old_repo" != "$repo" ] || [ "$old_path" != "$path" ]; then source_changed=1; fi
       if [ "$old_ver" = "$new_ver" ] && [ "$old_kind" = "$new_kind" ] && [ "$missing_md" = "0" ] && [ "$source_changed" = "0" ]; then
         ok "$n 已是最新（$(fmt_ver "$new_kind" "$new_ver")）"
+        if [ "$dry" != "1" ]; then succeeded=1; fi
       elif [ "$dry" = "1" ]; then
         if [ "$source_changed" = "1" ]; then
           info "[dry-run] $n：技能来源变化（$old_repo/$old_path → $repo/$path），将重新安装"
@@ -950,6 +971,8 @@ cmd_sync() {
         if ! install_one "$n" 1; then
           restore_entry "$n" "$original"
           failed=1
+        else
+          succeeded=1
         fi
       fi
       continue
@@ -963,12 +986,14 @@ cmd_sync() {
           info "[dry-run] $n：内容与最新版一致，将纳入管理"
         elif adopt_skill "$n" "$target" "$repo" "$path" "$new_ver" "$new_kind" "$(date '+%Y-%m-%d %H:%M')"; then
           ok "$n 已存在且内容与最新版一致，纳入管理"
+          succeeded=1
         else
           restore_entry "$n" "$original"
           failed=1
         fi
       elif [ "$force" != "1" ]; then
         warn "$n：已存在但内容与最新版不同，跳过（--force 可备份并更新）"
+        if [ "$dry" != "1" ]; then succeeded=1; fi
       elif [ "$dry" = "1" ]; then
         info "[dry-run] $n：已存在但内容不同，将备份并更新"
       else
@@ -976,6 +1001,8 @@ cmd_sync() {
         if ! install_one "$n" 1 1; then
           restore_entry "$n" "$original"
           failed=1
+        else
+          succeeded=1
         fi
       fi
     elif [ "$force" = "1" ]; then
@@ -986,17 +1013,20 @@ cmd_sync() {
         if ! install_one "$n" 1 1; then
           restore_entry "$n" "$original"
           failed=1
+        else
+          succeeded=1
         fi
       fi
     else
       warn "$n：已存在但无法获取远端 SKILL.md 校验，跳过（--force 可备份并更新）"
+      if [ "$dry" != "1" ]; then succeeded=1; fi
     fi
     rm -f "$TMP_FILE"
     TMP_FILE=""
   done
   if [ "$dry" = "1" ]; then
     info "dry-run 结束，未改动文件"
-  else
+  elif [ "$succeeded" = "1" ]; then
     touch_updated_at
     render_md
   fi

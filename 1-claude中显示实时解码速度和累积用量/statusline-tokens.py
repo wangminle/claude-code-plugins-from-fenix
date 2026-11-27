@@ -712,7 +712,7 @@ def track_transcript(tp, api_ms, use_cache=True):
     返回键：total_out（transcript 累计 output）、turn_out/turn_ms（本轮）、
     avg_out/avg_ms（会话累计 output 与 API 耗时，用于算平均）。
     """
-    key_source = tp if isinstance(tp, bytes) else tp.encode("utf-8", "surrogatepass")
+    key_source = tp if isinstance(tp, bytes) else tp.encode("utf-8", "surrogateescape")
     key = hashlib.sha256(key_source).hexdigest()[:16]
     cache_path = os.path.join(CACHE_DIR, key + ".json")
     state = load_cache(cache_path) if use_cache else {"offset": 0, "msgs": {}}
@@ -769,16 +769,22 @@ def track_transcript(tp, api_ms, use_cache=True):
                     "avg_ms": 0,
                 }
             if (
-                last_api == 0
+                api_ms > 0
+                and last_api == 0
                 and base_api == 0
                 and (
                     state["base_out"] > 0
-                    or (api_ms > 0 and total_out == prev_out and prev_out > 0)
+                    or (total_out == prev_out and prev_out > 0)
+                    or (
+                        prev_out > 0
+                        and new_prompt
+                        and new_prompt != state.get("prompt")
+                    )
                 )
             ):
-                # 已识别的历史，或首次收到正耗时但已有输出未增长：同时对齐
-                # 两条基线，排除该帧之前的累计值。已识别历史的同帧新输出也
-                # 一起进入基线；单轮且同帧有新增时，仍沿用首轮流式口径。
+                # 已识别的历史、零耗时后首次收到正耗时且已有输出未增长，或已有历史
+                # 输出后新提问与恢复耗时同帧到达：同时对齐两条基线，排除该帧之前的
+                # 累计值，避免把全历史耗时灌进新轮分母导致本轮显示 0.0 tok/s。
                 state["base_api_ms"] = api_ms
                 state["base_out"] = total_out
                 if new_prompt:
@@ -874,9 +880,10 @@ def main(no_cache=False):
         tp = os.path.expanduser(tp)
         candidates = [tp]
         if os.name != "nt":
-            # C locale 下 Python 3 的文件系统编码可能是 ASCII；同一路径的
-            # UTF-8 bytes 形式仍可正常 open/stat，且与字符串形式共用缓存键。
-            candidates.append(tp.encode("utf-8", "surrogatepass"))
+            # C locale 下 Python 3 的文件系统编码可能是 ASCII；用 surrogateescape
+            # 既保留含非 ASCII 的 HOME（由 expanduser 展开的代理字符），又把正常
+            # Unicode 编码为 UTF-8 bytes，与字符串形式共用同一缓存键。
+            candidates.append(tp.encode("utf-8", "surrogateescape"))
         for candidate in candidates:
             try:
                 if os.path.isfile(candidate):

@@ -682,6 +682,34 @@ class TestBug040SingleTurnResume(Base):
         self.assertIn("本轮 50.0 tok/s", out)
         self.assertIn("平均 50.0 tok/s", out)
 
+    def test_single_turn_resume_new_prompt_and_restored_duration_avoids_zero_turn_speed(self):
+        # Issue #1：单轮历史 + 首帧 api=0 -> 下一帧新提问与恢复累计耗时同块到达时，
+        # 不能拿 last_api=0 当新轮基线把全历史耗时灌进分母导致本轮长期 0.0 tok/s。
+        self.append(user_line("p1"), assistant_line("history", 500_000))
+        self.assertNotIn("本轮", self.render(0))
+
+        self.append(user_line("p2"), assistant_line("new1", 500))
+        out = self.render(20_000_000)
+        self.assertNotIn("本轮 0.0", out)
+        self.assertIn("平均 25.0 tok/s", out)
+
+        self.append(assistant_line("new2", 500))
+        out = self.render(20_005_400)
+        self.assertIn("本轮 92.6 tok/s", out)
+        self.assertNotIn("本轮 0.0", out)
+
+    def test_surrogateescape_tilde_path_in_c_locale(self):
+        # Issue #2：非 ASCII HOME 经 expanduser 产生 surrogateescape 代理字符时，
+        # 必须用 surrogateescape（而非 surrogatepass）编码，保持路径与缓存键一致。
+        mixed = "/tmp/\udce4\udcb8\udcad/会话.jsonl"
+        expected = "/tmp/中/会话.jsonl".encode("utf-8")
+        self.assertEqual(mixed.encode("utf-8", "surrogateescape"), expected)
+        key_mixed = self.m.hashlib.sha256(
+            mixed.encode("utf-8", "surrogateescape")
+        ).hexdigest()[:16]
+        key_utf8 = self.m.hashlib.sha256(expected).hexdigest()[:16]
+        self.assertEqual(key_mixed, key_utf8)
+
 
 class TestOpenIssuesSessionAndWindows(Base):
     def test_resume_restored_session_duration_uses_session_average(self):

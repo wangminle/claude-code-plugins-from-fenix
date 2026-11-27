@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-11-26",
+  "updated_at": "2026-11-28",
   "notes": [
     "安装只拉取 skills[].path 指向的子目录（git blobless + sparse checkout），先下载并校验到临时目录，成功后才替换旧目录，失败保留原版本。",
     "path 为空或为 \".\" 表示技能位于仓库根目录；此时无法只取子目录，安装会整仓浅克隆，脚本会提示。",
@@ -18,7 +18,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "创建、读取、编辑 Word 文档（含修订与批注）",
-      "checked_at": "2026-11-25 02:52"
+      "checked_at": "2026-11-28 00:33"
     },
     {
       "type": "文档处理",
@@ -28,7 +28,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "PDF 读取、合并拆分、表单与水印",
-      "checked_at": "2026-11-25 02:52"
+      "checked_at": "2026-11-28 00:33"
     },
     {
       "type": "文档处理",
@@ -38,7 +38,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "生成与编辑 PowerPoint 演示文稿",
-      "checked_at": "2026-11-25 02:52"
+      "checked_at": "2026-11-28 00:33"
     },
     {
       "type": "文档处理",
@@ -48,7 +48,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "读写 Excel 表格、公式与图表",
-      "checked_at": "2026-11-25 02:52"
+      "checked_at": "2026-11-28 00:33"
     },
     {
       "type": "文档处理",
@@ -58,17 +58,17 @@
       "version": "d2415eb1bbeca039c0a1c218948c692fa4227a85",
       "version_kind": "commit",
       "description": "Word 转 Markdown（含嵌入 Excel 表格与图片提取）",
-      "checked_at": "2026-11-25 02:52"
+      "checked_at": "2026-11-28 00:33"
     },
     {
       "type": "文档处理",
       "name": "pdf-markdown-summary",
       "repo": "wangminle/skills-pdf-markdown-summary",
       "path": "skills/pdf-markdown-summary",
-      "version": "53d8294fc47338b42e87da83402eb057beec2a57",
+      "version": "07e43e7fb57fbbb0c88efcd9d0329f3a25c0e9f6",
       "version_kind": "commit",
       "description": "PDF 转 Markdown 并提取图表做阅读摘要",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:33"
     },
     {
       "type": "文档处理",
@@ -78,7 +78,7 @@
       "version": "fa4c1ef1dd07f44167850db693c9515e7ea310a3",
       "version_kind": "commit",
       "description": "扫描版 PDF 或图片的局部编辑",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "内容抓取",
@@ -88,7 +88,7 @@
       "version": "8e4d8ddabc83aa759df8f95e322a1de7c97c9208",
       "version_kind": "commit",
       "description": "网页文章保存为 Markdown 并下载图片到本地",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "内容创作",
@@ -98,7 +98,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "结构化文档协作写作流程",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "内容创作",
@@ -108,7 +108,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "内部沟通文稿（状态报告、通报、FAQ 等）",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "内容创作",
@@ -118,7 +118,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "制作适配 Slack 的动画 GIF",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "内容创作",
@@ -128,7 +128,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "用 p5.js 生成算法艺术",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "内容创作",
@@ -138,7 +138,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "生成海报、插画等静态视觉作品",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "内容创作",
@@ -148,7 +148,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "应用 Anthropic 品牌色与版式",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "内容创作",
@@ -158,7 +158,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "为幻灯片、网页、报告套用主题",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "内容创作",
@@ -168,7 +168,7 @@
       "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
       "version_kind": "commit",
       "description": "UI 文案与界面写作规范",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "前端开发",
@@ -178,7 +178,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "高质量前端界面与视觉设计",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "前端开发",
@@ -188,7 +188,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "构建多组件 Web Artifact",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "前端开发",
@@ -198,7 +198,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "用 Playwright 测试本地 Web 应用",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "前端开发",
@@ -208,7 +208,7 @@
       "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
       "version_kind": "commit",
       "description": "React / Next.js 性能最佳实践",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "前端开发",
@@ -218,7 +218,7 @@
       "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
       "version_kind": "commit",
       "description": "React 组合式组件设计模式",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "前端开发",
@@ -228,7 +228,7 @@
       "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
       "version_kind": "commit",
       "description": "React Native / Expo 开发实践",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "前端开发",
@@ -238,7 +238,7 @@
       "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
       "version_kind": "commit",
       "description": "React 视图过渡动画",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "前端开发",
@@ -248,7 +248,7 @@
       "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
       "version_kind": "commit",
       "description": "Web 界面与可访问性规范审查",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "前端开发",
@@ -258,7 +258,7 @@
       "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
       "version_kind": "commit",
       "description": "把项目部署到 Vercel",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -268,7 +268,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "动工前澄清需求与设计",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -278,7 +278,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "编写分步实施计划",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -288,7 +288,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "按计划执行并在检查点复核",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -298,7 +298,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "先写失败测试再实现",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -308,7 +308,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "系统化定位 bug 根因",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -318,7 +318,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "声称完成前先跑验证拿证据",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -328,7 +328,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "完成后发起代码审查",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -338,7 +338,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "严谨处理审查意见而非盲从",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -348,7 +348,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "用 git worktree 隔离开发",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -358,7 +358,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "用子代理执行独立任务",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -368,7 +368,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "并行派发互不依赖的任务",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -378,7 +378,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "分支收尾：合并、PR 或清理",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "开发流程",
@@ -388,7 +388,7 @@
       "version": "v7.0.2",
       "version_kind": "tag",
       "description": "编写与调试 Skill",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "工程工具",
@@ -398,7 +398,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "构建高质量 MCP 服务器",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "工程工具",
@@ -408,7 +408,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "创建、改进与评测 Skill",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "工程工具",
@@ -418,17 +418,17 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "Claude API 参考（模型、价格、流式、工具调用）",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "项目管理",
       "name": "task-list-initialization",
       "repo": "wangminle/skills-task-list-initialization",
       "path": "skills/task-list-initialization",
-      "version": "37ca88aba885beb3c70f4307774a7fd0b7779560",
+      "version": "43c9987f36c476513a5cc71850f8efa2cdb85fea",
       "version_kind": "commit",
       "description": "建立与检查项目任务台账 task-list.md",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "辅助增强",
@@ -438,7 +438,7 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "回答问题前推荐 Claude Academy 的课程、教程与用例",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "辅助增强",
@@ -448,17 +448,17 @@
       "version": "e4bb5d960d87126ff3b3a8af1a104b7db67560ba",
       "version_kind": "commit",
       "description": "实质性回答后追加 2~3 个追问，帮用户核对事实、推理与遗漏背景",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "前端开发",
       "name": "impeccable",
       "repo": "pbakaus/impeccable",
       "path": ".claude/skills/impeccable",
-      "version": "skill-v4.10.0",
+      "version": "cli-v4.11.1",
       "version_kind": "tag",
       "description": "设计、重构、审查、打磨前端界面与设计系统",
-      "checked_at": "2026-11-25 02:53"
+      "checked_at": "2026-11-28 00:34"
     },
     {
       "type": "前端开发",
@@ -468,7 +468,7 @@
       "version": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
       "version_kind": "commit",
       "description": "Vercel 部署项目的成本与性能审计，给出有指标支撑的优化建议",
-      "checked_at": "2026-11-25 03:19"
+      "checked_at": "2026-11-28 00:34"
     }
   ]
 }

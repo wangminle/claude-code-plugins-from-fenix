@@ -457,14 +457,51 @@ class SkillsScriptTest(unittest.TestCase):
         self.assertIn("HTTP 404", output)
         self.assertNotIn("远端未验证", output)
 
+    def test_network_api_fallback_includes_skill_md_path(self):
+        # 防止 PowerShell 双引号里 "$apiPath?ref=$ver" 被当成变量名 $apiPath?ref 吞掉路径
+        bindir = self.tmp / "bin-api-url"
+        bindir.mkdir(exist_ok=True)
+        expected_fragment = f"contents/SKILL.md?ref={self.version}"
+        if self.native_windows:
+            curl = bindir / "curl.bat"
+            curl.write_text(
+                f"@echo off\r\necho %*| find \"{expected_fragment}\" >nul && (echo 200 & exit /b 0)\r\necho 000\r\n",
+                encoding="utf-8",
+            )
+            gh = bindir / "gh.bat"
+            gh.write_text("@echo off\r\nexit /b 1\r\n", encoding="utf-8")
+        else:
+            curl = bindir / "curl"
+            curl.write_text(
+                "#!/bin/sh\n"
+                f"case \"$*\" in\n  *{expected_fragment}*) printf '200'; exit 0 ;;\nesac\n"
+                "printf '000'\n",
+                encoding="utf-8",
+            )
+            curl.chmod(0o755)
+            gh = bindir / "gh"
+            gh.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            gh.chmod(0o755)
+        env = {"PATH": str(bindir) + os.pathsep + os.environ.get("PATH", "")}
+        if self.native_windows:
+            script = self.script.read_text(encoding="utf-8-sig")
+            boundary = "function Get-CurlCode("
+            override = 'if ($env:FENIX_TEST_CURL) { $script:CurlCmd = Get-Command $env:FENIX_TEST_CURL }\n\n'
+            if override not in script:
+                self.script.write_text(script.replace(boundary, override + boundary, 1), encoding="utf-8-sig")
+            env["FENIX_TEST_CURL"] = str(curl)
+        proc = self.run_script("check", "--network", env=env)
+        self.assertIn("远端检查通过", proc.stdout)
+
     def test_sync_failure_returns_nonzero_and_restores_entry(self):
         data = self.read_data()
         data["skills"][0]["path"] = "missing"
         self.write_data(data["skills"])
-        before = self.read_data()["skills"][0]
+        before_data = self.read_data()
         proc = self.run_script("sync", "root-skill", "--target", self.target, expected=1)
         self.assertIn("缺少 SKILL.md", proc.stdout + proc.stderr)
-        self.assertEqual(self.read_data()["skills"][0], before)
+        self.assertEqual(self.read_data(), before_data)
+        self.assertFalse(self.md.exists())
         self.assertFalse((self.target / "root-skill").exists())
 
     def test_status_compares_full_version_and_kind(self):
@@ -491,18 +528,23 @@ class SkillsScriptTest(unittest.TestCase):
             repo="demo/anchor", path="demo", version="v1.0.0", version_kind="tag"
         )
         self.write_data(data["skills"])
-        bindir = self.tmp / "bin-git-log"
-        bindir.mkdir()
         real_git = shutil.which("git")
         log = self.tmp / "git.log"
         if self.native_windows:
-            wrapper = bindir / "git.bat"
-            wrapper.write_text(
-                "@echo off\r\n>>\"%GIT_LOG%\" echo %*\r\n"
-                "\"%REAL_GIT%\" %*\r\nexit /b %errorlevel%\r\n",
-                encoding="utf-8",
+            # Windows 下 cmd.exe 的 .bat 包装会吞掉 FETCH_HEAD^{commit} 中的 ^，
+            # 改用 PowerShell 函数拦截并原样转发给真实 git.exe。
+            script = self.script.read_text(encoding="utf-8-sig")
+            self.script.write_text(
+                "function git {\n"
+                "  Add-Content -LiteralPath $env:GIT_LOG -Value ($args -join ' ') -Encoding UTF8\n"
+                "  & $env:REAL_GIT @args\n"
+                "}\n" + script,
+                encoding="utf-8-sig",
             )
+            env = {"GIT_LOG": str(log), "REAL_GIT": str(real_git)}
         else:
+            bindir = self.tmp / "bin-git-log"
+            bindir.mkdir()
             wrapper = bindir / "git"
             wrapper.write_text(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_LOG\"\n"
@@ -510,10 +552,10 @@ class SkillsScriptTest(unittest.TestCase):
                 encoding="utf-8",
             )
             wrapper.chmod(0o755)
-        env = {
-            "PATH": str(bindir) + os.pathsep + os.environ["PATH"],
-            "GIT_LOG": str(log), "REAL_GIT": str(real_git),
-        }
+            env = {
+                "PATH": str(bindir) + os.pathsep + os.environ["PATH"],
+                "GIT_LOG": str(log), "REAL_GIT": str(real_git),
+            }
         self.run_script("install", "root-skill", "--target", self.target, env=env)
         self.assertIn("sparse-checkout set --no-cone /demo/", log.read_text(encoding="utf-8"))
         self.assertTrue((self.target / "root-skill" / "SKILL.md").is_file())
@@ -926,7 +968,7 @@ class PowerShellSkillsScriptTest(SkillsScriptTest):
         source = SOURCE.with_suffix(".ps1").read_text(encoding="utf-8-sig")
         source = source.replace("$GitHub = 'https://github.com'", f"$GitHub = '{self.remote}'")
         self.script = self.tmp / "fenix-selected-skills.ps1"
-        self.script.write_text(source, encoding="utf-8")
+        self.script.write_text(source, encoding="utf-8-sig")
 
     def run_script(self, *args, env=None, expected=0):
         command = [
@@ -978,7 +1020,7 @@ class NativeWindowsPowerShellSkillsScriptTest(SkillsScriptTest):
         source = SOURCE.with_suffix(".ps1").read_text(encoding="utf-8-sig")
         source = source.replace("$GitHub = 'https://github.com'", f"$GitHub = '{self.remote}'")
         self.script = self.tmp / "fenix-selected-skills.ps1"
-        self.script.write_text(source, encoding="utf-8")
+        self.script.write_text(source, encoding="utf-8-sig")
 
     def run_script(self, *args, env=None, expected=0):
         actual_env = dict(os.environ, HOME=str(self.tmp), NO_COLOR="1")

@@ -452,14 +452,14 @@ function Get-RemoteSkillMd($repo, $ver, $path, $outFile) {
   $apiPath = 'SKILL.md'
   if ($path -and $path -ne '.') { $apiPath = "$path/SKILL.md" }
   $raw = "https://raw.githubusercontent.com/$repo/$ver/$apiPath"
-  $api = "https://api.github.com/repos/$repo/contents/$apiPath?ref=$ver"
+  $api = "https://api.github.com/repos/$repo/contents/${apiPath}?ref=$ver"
   if ($script:CurlCmd) {
     $curl = Invoke-NativeCapture $script:CurlCmd.Source @('-fsS', '--retry', '2', '--retry-delay', '1', '--connect-timeout', '5', '--max-time', '15', '-o', $outFile, $raw)
     if ($curl.Code -eq 0) { return $true }
   }
   if (Get-WebClientFile $raw $outFile $null) { return $true }
   if (Get-Command gh -ErrorAction SilentlyContinue) {
-    $result = Invoke-NativeCapture 'gh' @('api', "repos/$repo/contents/$apiPath?ref=$ver", '-H', 'Accept: application/vnd.github.raw')
+    $result = Invoke-NativeCapture 'gh' @('api', "repos/$repo/contents/${apiPath}?ref=$ver", '-H', 'Accept: application/vnd.github.raw')
     if ($result.Code -eq 0) {
       $lines = @($result.Output | ForEach-Object { [string]$_ })
       $enc = New-Object System.Text.UTF8Encoding($false)
@@ -759,9 +759,8 @@ function Cmd-Sync([string[]]$names, [bool]$force = $false, [bool]$dry = $false) 
   $names = @($names | Select-Object -Unique)
   Write-Info "目标目录：$SkillsDir"
   $cache = @{}
-  $latestByName = @{}
-  $originalByName = @{}
   $failed = $false
+  $succeeded = $false
   foreach ($name in $names) {
     $entry = Get-Entry $data $name
     if (-not $entry) { Write-Warn "$name 不在名单中，跳过"; $failed = $true; continue }
@@ -769,38 +768,35 @@ function Cmd-Sync([string[]]$names, [bool]$force = $false, [bool]$dry = $false) 
     if (-not $cache.ContainsKey($repo)) { $cache[$repo] = Resolve-Version $repo }
     $latest = $cache[$repo]
     if (-not $latest) { Write-Warn "$name：查询 $repo 失败，跳过"; $failed = $true; continue }
-    $latestByName[$name] = $latest
-    if (-not $originalByName.ContainsKey($name)) {
-      $originalByName[$name] = [pscustomobject]@{
-        version = [string]$entry.version; kind = [string]$entry.version_kind; checkedAt = [string]$entry.checked_at
-      }
+    $original = [pscustomobject]@{
+      version = [string]$entry.version; kind = [string]$entry.version_kind; checkedAt = [string]$entry.checked_at
     }
-    if (-not $dry) { Update-EntryVersion $data $name $latest.version $latest.kind (Get-Date -Format 'yyyy-MM-dd HH:mm') }
+    if (-not $dry) {
+      Update-EntryVersion $data $name $latest.version $latest.kind (Get-Date -Format 'yyyy-MM-dd HH:mm')
+      Save-Json $DataFile $data
+    }
+    try {
+      $success = Sync-One $data $name $latest $force $dry
+    } catch {
+      Write-ErrLine "$name：同步失败（$($_.Exception.Message)）"
+      $success = $false
+    }
+    if (-not $success) {
+      $failed = $true
+      if (-not $dry) {
+        Update-EntryVersion $data $name $original.version $original.kind $original.checkedAt
+        Save-Json $DataFile $data
+      }
+    } elseif (-not $dry) {
+      $succeeded = $true
+    }
   }
-  if (-not $dry) {
+  if ($dry) { Write-Info "dry-run 结束，未改动文件" }
+  elseif ($succeeded) {
     $data.updated_at = Get-Date -Format 'yyyy-MM-dd'
     Save-Json $DataFile $data
+    Cmd-Render
   }
-  foreach ($name in $names) {
-    if ($latestByName.ContainsKey($name)) {
-      try {
-        $success = Sync-One $data $name $latestByName[$name] $force $dry
-      } catch {
-        Write-ErrLine "$name：同步失败（$($_.Exception.Message)）"
-        $success = $false
-      }
-      if (-not $success) {
-        $failed = $true
-        if (-not $dry) {
-          $original = $originalByName[$name]
-          Update-EntryVersion $data $name $original.version $original.kind $original.checkedAt
-        }
-      }
-    }
-  }
-  if (-not $dry -and $failed) { Save-Json $DataFile $data }
-  if ($dry) { Write-Info "dry-run 结束，未改动文件" }
-  else { Cmd-Render }
   if ($failed) { Fail '部分技能同步失败' }
 }
 
@@ -810,6 +806,7 @@ function Cmd-Update([string[]]$names) {
   if (-not $names -or $names.Count -eq 0) { Fail "还没有安装记录，先运行 fenix-selected-skills.ps1 sync 或 install" }
   $cache = @{}
   $failed = $false
+  $succeeded = $false
   foreach ($name in $names) {
     $entry = Get-Entry $data $name
     if (-not $entry) { Write-Warn "$name 不在名单中，跳过"; $failed = $true; continue }
@@ -830,6 +827,8 @@ function Cmd-Update([string[]]$names) {
         $failed = $true
         Update-EntryVersion $data $name $original.version $original.kind $original.checkedAt
         Save-Json $DataFile $data
+      } else {
+        $succeeded = $true
       }
       continue
     }
@@ -840,6 +839,7 @@ function Cmd-Update([string[]]$names) {
     Save-Json $DataFile $data
     if ($inst.version -eq $latest.version -and $inst.kind -eq $latest.kind -and -not $sourceChanged) {
       Write-Ok "$name 已是最新（$(Format-Ver $latest.kind $latest.version)）"
+      $succeeded = $true
     } else {
       if ($sourceChanged) { Write-Info "$name：技能来源变化（$($inst.repo)/$($inst.path) → $repo/$entryPath），重新安装" }
       else { Write-Info "$name：$(Format-Ver $inst.kind $inst.version) → $(Format-Ver $latest.kind $latest.version)" }
@@ -847,12 +847,16 @@ function Cmd-Update([string[]]$names) {
         $failed = $true
         Update-EntryVersion $data $name $original.version $original.kind $original.checkedAt
         Save-Json $DataFile $data
+      } else {
+        $succeeded = $true
       }
     }
   }
-  $data.updated_at = Get-Date -Format 'yyyy-MM-dd'
-  Save-Json $DataFile $data
-  Cmd-Render
+  if ($succeeded) {
+    $data.updated_at = Get-Date -Format 'yyyy-MM-dd'
+    Save-Json $DataFile $data
+    Cmd-Render
+  }
   if ($failed) { Fail '部分技能更新失败' }
 }
 
@@ -908,13 +912,13 @@ function Get-RemoteCode($repo, $ver, $path) {
   $apiPath = 'SKILL.md'
   if ($path -and $path -ne '.') { $apiPath = "$path/SKILL.md" }
   $raw = "https://raw.githubusercontent.com/$repo/$ver/$apiPath"
-  $api = "https://api.github.com/repos/$repo/contents/$apiPath?ref=$ver"
+  $api = "https://api.github.com/repos/$repo/contents/${apiPath}?ref=$ver"
   if ($script:CurlCmd) { $rawCode = Get-CurlCode $raw }
   else { $rawCode = Get-WebClientCode $raw $null }
   if ($rawCode -eq '200') { return '200' }
   $gh = Get-Command gh -ErrorAction SilentlyContinue
   if ($gh) {
-    $result = Invoke-NativeCapture 'gh' @('api', "repos/$repo/contents/$apiPath?ref=$ver")
+    $result = Invoke-NativeCapture 'gh' @('api', "repos/$repo/contents/${apiPath}?ref=$ver")
     if ($result.Code -eq 0) { return '200' }
   }
   if ($script:CurlCmd) { $apiCode = Get-CurlCode $api 'application/vnd.github+json' }

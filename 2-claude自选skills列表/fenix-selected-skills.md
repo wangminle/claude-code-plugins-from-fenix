@@ -8,14 +8,14 @@
 > 默认安装到用户级 ~/.claude/skills；--target project 安装到当前目录的 .claude/skills，--target <目录> 可指定任意位置。
 > 平台：macOS / Linux / WSL 使用 fenix-selected-skills.sh；Windows 使用 fenix-selected-skills.ps1 或 fenix-selected-skills.cmd；脚本会自动检测环境并切换对应实现。
 
-共 46 项 · 更新于 2026-11-26 16:00
+共 46 项 · 更新于 2026-11-28 00:34
 
 | 类型 | 名称 | GitHub | 仓库路径 | 名单版本 | 说明 |
 | --- | --- | --- | --- | --- | --- |
 | 文档处理 | docx | [anthropics/skills](https://github.com/anthropics/skills) | skills/docx | e4bb5d96 | 创建、读取、编辑 Word 文档（含修订与批注） |
 | 文档处理 | docx-to-markdown | [wangminle/skills-doc-to-md](https://github.com/wangminle/skills-doc-to-md) | skills/docx-to-markdown | d2415eb1 | Word 转 Markdown（含嵌入 Excel 表格与图片提取） |
 | 文档处理 | pdf | [anthropics/skills](https://github.com/anthropics/skills) | skills/pdf | e4bb5d96 | PDF 读取、合并拆分、表单与水印 |
-| 文档处理 | pdf-markdown-summary | [wangminle/skills-pdf-markdown-summary](https://github.com/wangminle/skills-pdf-markdown-summary) | skills/pdf-markdown-summary | 53d8294f | PDF 转 Markdown 并提取图表做阅读摘要 |
+| 文档处理 | pdf-markdown-summary | [wangminle/skills-pdf-markdown-summary](https://github.com/wangminle/skills-pdf-markdown-summary) | skills/pdf-markdown-summary | 07e43e7f | PDF 转 Markdown 并提取图表做阅读摘要 |
 | 文档处理 | pptx | [anthropics/skills](https://github.com/anthropics/skills) | skills/pptx | e4bb5d96 | 生成与编辑 PowerPoint 演示文稿 |
 | 文档处理 | scanned-pdf-editor | [wangminle/skills-scanned-pdf-editor](https://github.com/wangminle/skills-scanned-pdf-editor) | skills/scanned-pdf-editor | fa4c1ef1 | 扫描版 PDF 或图片的局部编辑 |
 | 文档处理 | xlsx | [anthropics/skills](https://github.com/anthropics/skills) | skills/xlsx | e4bb5d96 | 读写 Excel 表格、公式与图表 |
@@ -31,7 +31,7 @@
 | 前端开发 | composition-patterns | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) | skills/composition-patterns | 5a37a632 | React 组合式组件设计模式 |
 | 前端开发 | deploy-to-vercel | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) | skills/deploy-to-vercel | 5a37a632 | 把项目部署到 Vercel |
 | 前端开发 | frontend-design | [anthropics/skills](https://github.com/anthropics/skills) | skills/frontend-design | e4bb5d96 | 高质量前端界面与视觉设计 |
-| 前端开发 | impeccable | [pbakaus/impeccable](https://github.com/pbakaus/impeccable) | .claude/skills/impeccable | skill-v4.10.0 | 设计、重构、审查、打磨前端界面与设计系统 |
+| 前端开发 | impeccable | [pbakaus/impeccable](https://github.com/pbakaus/impeccable) | .claude/skills/impeccable | cli-v4.11.1 | 设计、重构、审查、打磨前端界面与设计系统 |
 | 前端开发 | react-best-practices | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) | skills/react-best-practices | 5a37a632 | React / Next.js 性能最佳实践 |
 | 前端开发 | react-native-skills | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) | skills/react-native-skills | 5a37a632 | React Native / Expo 开发实践 |
 | 前端开发 | react-view-transitions | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) | skills/react-view-transitions | 5a37a632 | React 视图过渡动画 |
@@ -55,7 +55,7 @@
 | 工程工具 | claude-api | [anthropics/skills](https://github.com/anthropics/skills) | skills/claude-api | e4bb5d96 | Claude API 参考（模型、价格、流式、工具调用） |
 | 工程工具 | mcp-builder | [anthropics/skills](https://github.com/anthropics/skills) | skills/mcp-builder | e4bb5d96 | 构建高质量 MCP 服务器 |
 | 工程工具 | skill-creator | [anthropics/skills](https://github.com/anthropics/skills) | skills/skill-creator | e4bb5d96 | 创建、改进与评测 Skill |
-| 项目管理 | task-list-initialization | [wangminle/skills-task-list-initialization](https://github.com/wangminle/skills-task-list-initialization) | skills/task-list-initialization | 37ca88ab | 建立与检查项目任务台账 task-list.md |
+| 项目管理 | task-list-initialization | [wangminle/skills-task-list-initialization](https://github.com/wangminle/skills-task-list-initialization) | skills/task-list-initialization | 43c9987f | 建立与检查项目任务台账 task-list.md |
 | 辅助增强 | academy-guide | [anthropics/skills](https://github.com/anthropics/skills) | skills/academy-guide | e4bb5d96 | 回答问题前推荐 Claude Academy 的课程、教程与用例 |
 | 辅助增强 | discernment-nudge | [anthropics/skills](https://github.com/anthropics/skills) | skills/discernment-nudge | e4bb5d96 | 实质性回答后追加 2~3 个追问，帮用户核对事实、推理与遗漏背景 |
 
